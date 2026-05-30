@@ -4,9 +4,13 @@ import re
 import shutil
 import hashlib
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+CODEBOARDING_DIR_NAME = ".codeboarding"
+ANALYSIS_FILENAME = "analysis.json"
 
 
 class CFGGenerationError(Exception):
@@ -28,7 +32,24 @@ def remove_temp_repo_folder(temp_path: str):
 
 
 def get_cache_dir(repo_dir: Path) -> Path:
-    return repo_dir / ".codeboarding" / "cache"
+    """Wipeable per-file/per-language indices (e.g. ``incremental_cache_<lang>.json``).
+
+    Anything under here may be deleted at any time; consumers must tolerate
+    cache misses. Run-artifact files (e.g. ``static_analysis.pkl``) belong in
+    :func:`get_artifact_dir` instead.
+    """
+    return repo_dir / CODEBOARDING_DIR_NAME / "cache"
+
+
+def get_artifact_dir(repo_dir: Path) -> Path:
+    """Sibling-of-``analysis.json`` directory for run-artifact files.
+
+    Run artifacts are the outputs of one successful ``analyze()`` invocation
+    (e.g. ``analysis.json``, ``static_analysis.pkl``). They survive across
+    runs, deserve atomic promotion, and must not be wiped by snapshot
+    preparation. Distinct from :func:`get_cache_dir`.
+    """
+    return repo_dir / CODEBOARDING_DIR_NAME
 
 
 def get_project_root() -> Path:
@@ -91,3 +112,12 @@ def sanitize(name: str) -> str:
 
 def generate_run_id() -> str:
     return uuid.uuid4().hex
+
+
+def copy_files(files: Iterable[Path], target_dir: Path) -> None:
+    """Copy each file in *files* into *target_dir*, preserving metadata."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for file in files:
+        dest = target_dir / file.name
+        shutil.copy2(file, dest)
+        logger.info("Copied %s to %s", file.name, dest)

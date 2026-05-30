@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
-from agents.agent_responses import AnalysisInsights, ClusterAnalysis, ComponentFiles
+from agents.agent_responses import AnalysisInsights, ClusterAnalysis, ComponentFiles, ScopeRelations
 from repo_utils import normalize_path
 from static_analyzer.graph import CallGraph, ClusterResult
 
@@ -41,6 +41,7 @@ class ValidationContext:
     expected_cluster_ids: set[int] = field(default_factory=set)
     expected_files: set[str] = field(default_factory=set)
     valid_component_names: set[str] = field(default_factory=set)  # For file classification validation
+    existing_component_ids: set[str] = field(default_factory=set)  # For incremental ID-based routing validation
     repo_dir: str | None = None  # For path normalization
     static_analysis: StaticAnalysisResults | None = None  # For qualified name validation
     llm_cluster_analysis: ClusterAnalysis | None = None  # For group name coverage validation
@@ -142,6 +143,41 @@ def validate_cluster_coverage(result: ClusterAnalysis, context: ValidationContex
         return ValidationResult(is_valid=True)
 
     return ValidationResult(is_valid=False, feedback_messages=feedback_messages)
+
+
+def validate_existing_component_ids(result: ClusterAnalysis, context: ValidationContext) -> ValidationResult:
+    """Reject ``existing_component_id`` values the LLM hallucinated.
+
+    Why: incremental routing identifies existing components by id (decision
+    #4). A hallucinated id silently creates a new component during stitching
+    instead of routing into the intended one. Catching it here forces the
+    LLM to retry with a valid id (or null for new components) before any
+    state mutation.
+    """
+    if not context.existing_component_ids:
+        return ValidationResult(is_valid=True)
+
+    feedback_messages: list[str] = []
+    valid_str = ", ".join(sorted(context.existing_component_ids))
+    for cc in result.cluster_components:
+        if cc.existing_component_id is None:
+            continue
+        if cc.existing_component_id not in context.existing_component_ids:
+            feedback_messages.append(
+                f"cluster_components entry '{cc.name}' references "
+                f"existing_component_id={cc.existing_component_id!r} which does not "
+                f"match any live component. Either set existing_component_id to a "
+                f"value from the existing-components list ({valid_str}), or set it "
+                f"to null to create a new component."
+            )
+
+    if feedback_messages:
+        logger.warning(
+            "[Validation] %d cluster_components entries reference unknown existing_component_id",
+            len(feedback_messages),
+        )
+        return ValidationResult(is_valid=False, feedback_messages=feedback_messages)
+    return ValidationResult(is_valid=True)
 
 
 def _normalize_group_name(name: str) -> str:
@@ -322,11 +358,9 @@ def validate_group_name_coverage(result: AnalysisInsights, context: ValidationCo
 def validate_key_entities(result: AnalysisInsights, context: ValidationContext) -> ValidationResult:
     """
     Validate key_entities on every component:
-    1. Every component must have at least one key_entity.
-    2. Key entities must reference code within the component's cluster scope.
-       If cluster_results are provided, validates strictly against the scope.
-       Otherwise, validates that qualified names exist in the static analysis.
-       Uses loose matching to auto-correct shortened paths in-place.
+    1. Auto-correct qualified names via loose matching.
+    2. Silently drop invalid key entities (out of scope or not found).
+    3. Only fail if a component ends up with zero key_entities after dropping.
 
     Args:
         result: AnalysisInsights containing components with key_entities
@@ -334,26 +368,8 @@ def validate_key_entities(result: AnalysisInsights, context: ValidationContext) 
                  and cluster_results for scope validation
 
     Returns:
-        ValidationResult with feedback for missing or invalid key entities
+        ValidationResult with feedback only for components left with zero key entities
     """
-    feedback_messages: list[str] = []
-
-    # Check 1: components without any key_entities
-    components_without_key_entities = [c.name for c in result.components if not c.key_entities]
-    if components_without_key_entities:
-        missing_str = ", ".join(components_without_key_entities)
-        feedback_messages.append(
-            f"The following components are missing key entities: {missing_str}. "
-            f"Every component must have at least one key entity (critical class or method) "
-            f"that represents its core functionality. Please identify and add 2-5 key entities "
-            f"for each component."
-        )
-        logger.warning(f"[Validation] Components without key entities: {missing_str}")
-
-    # Check 2: Unified scope/existence check — key entities must be valid for this component.
-    # Auto-correct via loose matching first (fixes typos in qualified names).
-    # Then validate against cluster scope (strict) or static analysis existence (fallback).
-    invalid_entities: list[str] = []
     auto_corrected = 0
 
     # Auto-correct qualified names via loose matching (always, when static_analysis available)
@@ -361,27 +377,19 @@ def validate_key_entities(result: AnalysisInsights, context: ValidationContext) 
         for component in result.components:
             for key_entity in component.key_entities:
                 qname = key_entity.qualified_name.replace("/", ".")
-                for lang in context.static_analysis.get_languages():
-                    # Exact / case-insensitive match
-                    try:
-                        context.static_analysis.get_reference(lang, qname)
-                        break
-                    except (ValueError, FileExistsError):
-                        pass
-                    # Loose match – auto-correct the qualified name in-place
-                    _text, loose_node = context.static_analysis.get_loose_reference(lang, qname)
-                    if loose_node is not None:
-                        logger.info(
-                            f"[Validation] Auto-corrected qualified name: "
-                            f"'{key_entity.qualified_name}' -> '{loose_node.fully_qualified_name}'"
-                        )
-                        key_entity.qualified_name = loose_node.fully_qualified_name
-                        auto_corrected += 1
-                        break
+                node = context.static_analysis.resolve_across_languages(qname)
+                if node is not None and node.fully_qualified_name != qname:
+                    logger.info(
+                        f"[Validation] Auto-corrected qualified name: "
+                        f"'{key_entity.qualified_name}' -> '{node.fully_qualified_name}'"
+                    )
+                    key_entity.qualified_name = node.fully_qualified_name
+                    auto_corrected += 1
         if auto_corrected:
             logger.info(f"[Validation] Auto-corrected {auto_corrected} qualified names via loose matching")
 
-    # Validate: cluster scope if available, else static analysis existence
+    # Silently drop invalid key entities
+    dropped = 0
     if context.cluster_results:
         nodes_in_scope: set[str] = set()
         for cr in context.cluster_results.values():
@@ -389,67 +397,54 @@ def validate_key_entities(result: AnalysisInsights, context: ValidationContext) 
                 nodes_in_scope.update(members)
 
         for component in result.components:
+            valid = []
             for key_entity in component.key_entities:
                 qname = key_entity.qualified_name
                 in_scope = qname in nodes_in_scope
                 if not in_scope:
                     for scope_node in nodes_in_scope:
-                        if qname.startswith(scope_node + "."):
+                        if qname.startswith(scope_node + ".") or scope_node.startswith(qname + "."):
                             in_scope = True
                             break
-                    if not in_scope:
-                        for scope_node in nodes_in_scope:
-                            if scope_node.startswith(qname + "."):
-                                in_scope = True
-                                break
-                if not in_scope:
-                    invalid_entities.append(f"{component.name}: '{qname}'")
-
-        if invalid_entities:
-            invalid_str = "; ".join(invalid_entities[:10])
-            more_msg = f" and {len(invalid_entities) - 10} more" if len(invalid_entities) > 10 else ""
-            feedback_messages.append(
-                f"The following key_entities are outside the component's cluster scope: {invalid_str}{more_msg}. "
-                f"Key entities must reference code that is within the component's assigned clusters. "
-                f"Please choose key entities from the code shown in the cluster analysis."
-            )
-            logger.warning(f"[Validation] Invalid key entities (out of scope): {len(invalid_entities)} found")
+                if in_scope:
+                    valid.append(key_entity)
+                else:
+                    dropped += 1
+            component.key_entities = valid
 
     elif context.static_analysis:
-        # No cluster_results — fall back to checking if qualified names exist in static analysis
         for component in result.components:
+            valid = []
             for key_entity in component.key_entities:
                 qname = key_entity.qualified_name.replace("/", ".")
-                found = False
-                for lang in context.static_analysis.get_languages():
-                    try:
-                        context.static_analysis.get_reference(lang, qname)
-                        found = True
-                        break
-                    except (ValueError, FileExistsError):
-                        pass
-                    _text, loose_node = context.static_analysis.get_loose_reference(lang, qname)
-                    if loose_node is not None:
-                        key_entity.qualified_name = loose_node.fully_qualified_name
-                        found = True
-                        break
-                if not found:
-                    invalid_entities.append(f"{component.name}: '{key_entity.qualified_name}'")
+                node = context.static_analysis.resolve_across_languages(qname)
+                if node is not None:
+                    if node.fully_qualified_name != qname:
+                        key_entity.qualified_name = node.fully_qualified_name
+                    valid.append(key_entity)
+                else:
+                    dropped += 1
+            component.key_entities = valid
 
-        if invalid_entities:
-            invalid_str = "; ".join(invalid_entities[:10])
-            more_msg = f" and {len(invalid_entities) - 10} more" if len(invalid_entities) > 10 else ""
-            feedback_messages.append(
-                f"The following qualified names do not exist in the static analysis: {invalid_str}{more_msg}. "
-                f"Please ensure all key_entities use qualified names that were found during static analysis."
-            )
-            logger.warning(f"[Validation] Invalid key entities (not found): {len(invalid_entities)} found")
+    if dropped:
+        logger.info(f"[Validation] Silently dropped {dropped} invalid key entities")
 
-    if not feedback_messages:
-        logger.info("[Validation] All key entities are valid")
-        return ValidationResult(is_valid=True)
+    # Only fail if any component ended up with zero key_entities
+    empty_components = [c.name for c in result.components if not c.key_entities]
+    if empty_components:
+        missing_str = ", ".join(empty_components)
+        logger.warning(f"[Validation] Components with no valid key entities after cleanup: {missing_str}")
+        return ValidationResult(
+            is_valid=False,
+            feedback_messages=[
+                f"The following components have no valid key entities: {missing_str}. "
+                f"Every component must have at least one key entity (critical class or method) "
+                f"that represents its core functionality. Use exact qualified names from the cluster analysis."
+            ],
+        )
 
-    return ValidationResult(is_valid=False, feedback_messages=feedback_messages)
+    logger.info("[Validation] All key entities are valid")
+    return ValidationResult(is_valid=True)
 
 
 def validate_file_classifications(result: ComponentFiles, context: ValidationContext) -> ValidationResult:
@@ -556,6 +551,35 @@ def validate_relation_component_names(result: AnalysisInsights, _context: Valida
     )
 
     logger.warning(f"[Validation] Relations with unknown component names: {invalid_str}")
+    return ValidationResult(is_valid=False, feedback_messages=[feedback])
+
+
+def validate_scope_relation_names(result: ScopeRelations, _context: ValidationContext) -> ValidationResult:
+    """Validate that src_name/dst_name in scope relations match known component names."""
+    known_names = _context.valid_component_names
+    if not known_names:
+        return ValidationResult(is_valid=True)
+
+    invalid: list[str] = []
+    for rel in result.components_relations:
+        unknown: list[str] = []
+        if rel.src_name not in known_names:
+            unknown.append(f"src_name='{rel.src_name}'")
+        if rel.dst_name not in known_names:
+            unknown.append(f"dst_name='{rel.dst_name}'")
+        if unknown:
+            invalid.append(f"({rel.src_name} -{rel.relation}-> {rel.dst_name}): {', '.join(unknown)}")
+
+    if not invalid:
+        return ValidationResult(is_valid=True)
+
+    known_str = ", ".join(sorted(known_names))
+    feedback = (
+        f"The following relations reference component names that do not exist: {'; '.join(invalid)}. "
+        f"Known component names are: {known_str}. "
+        f"Ensure src_name and dst_name match an existing component name exactly."
+    )
+    logger.warning(f"[Validation] Scope relations with unknown names: {'; '.join(invalid)}")
     return ValidationResult(is_valid=False, feedback_messages=[feedback])
 
 

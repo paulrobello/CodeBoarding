@@ -1,13 +1,15 @@
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import networkx as nx
 
+from agents.cluster_budget import ClusterPromptBudget
 from agents.cluster_methods_mixin import ClusterMethodsMixin
 from agents.agent_responses import AnalysisInsights, Component, SourceCodeReference
+from agents.model_capabilities import ContextWindow
 from static_analyzer.graph import CallGraph, ClusterResult
-from static_analyzer.constants import NodeType
+from static_analyzer.constants import Language, NodeType
 from static_analyzer.node import Node
 
 
@@ -80,8 +82,8 @@ class TestFindNearestCluster(unittest.TestCase):
     def _make_call_graph(self) -> CallGraph:
         """Build a small CallGraph: A->B->C->D, C->E."""
         cfg = CallGraph(language="python")
-        for name in ("A", "B", "C", "D", "E"):
-            cfg.add_node(Node(name, NodeType.FUNCTION, "/src/mod.py", 1, 10))
+        for i, name in enumerate(("A", "B", "C", "D", "E")):
+            cfg.add_node(Node(name, NodeType.FUNCTION, "/src/mod.py", i * 10 + 1, i * 10 + 10))
         cfg.add_edge("A", "B")
         cfg.add_edge("B", "C")
         cfg.add_edge("C", "D")
@@ -158,8 +160,8 @@ class TestFindNearestCluster(unittest.TestCase):
         and test from W: W is distance-1 from X (cluster 10), distance-3 from Z (cluster 20).
         """
         cfg = CallGraph(language="python")
-        for name in ("W", "X", "Y", "Z"):
-            cfg.add_node(Node(name, NodeType.FUNCTION, "/src/mod.py", 1, 10))
+        for i, name in enumerate(("W", "X", "Y", "Z")):
+            cfg.add_node(Node(name, NodeType.FUNCTION, "/src/mod.py", i * 10 + 1, i * 10 + 10))
         cfg.add_edge("W", "X")
         cfg.add_edge("X", "Y")
         cfg.add_edge("Y", "Z")
@@ -184,14 +186,14 @@ class TestBuildFileMethodsFromNodes(unittest.TestCase):
         mixin = MockMixin(repo_dir=Path("/repo"), static_analysis=static)
 
         duplicate_specific = Node(
-            "diagram_analysis.diagram_generator.DiagramGenerator.generate_analysis_smart",
+            "diagram_analysis.diagram_generator.DiagramGenerator.generate_analysis",
             NodeType.METHOD,
             "/repo/diagram_analysis/diagram_generator.py",
             468,
             470,
         )
         duplicate_alias = Node(
-            "diagram_analysis.diagram_generator.generate_analysis_smart",
+            "diagram_analysis.diagram_generator.generate_analysis",
             NodeType.METHOD,
             "/repo/diagram_analysis/diagram_generator.py",
             468,
@@ -205,8 +207,47 @@ class TestBuildFileMethodsFromNodes(unittest.TestCase):
         self.assertEqual(len(groups[0].methods), 1)
         self.assertEqual(
             groups[0].methods[0].qualified_name,
-            "diagram_analysis.diagram_generator.DiagramGenerator.generate_analysis_smart",
+            "diagram_analysis.diagram_generator.DiagramGenerator.generate_analysis",
         )
+
+
+class TestClusterStringBudgeting(unittest.TestCase):
+    def _make_graph(self, language: str, names: list[str]) -> CallGraph:
+        cfg = CallGraph(language=language)
+        for index, name in enumerate(names, start=1):
+            cfg.add_node(Node(name, NodeType.FUNCTION, f"/repo/{language}.py", index, index + 1))
+        for src, dst in zip(names, names[1:]):
+            cfg.add_edge(src, dst)
+        return cfg
+
+    def test_combined_render_that_fits_does_not_use_per_language_skip_planning(self):
+        python_names = ["py." + ("large_name_" * 20) + str(i) for i in range(8)]
+        js_names = ["js.a", "js.b"]
+        py_cfg = self._make_graph("python", python_names)
+        js_cfg = self._make_graph("javascript", js_names)
+        cluster_results = {
+            "python": ClusterResult(clusters={1: set(python_names)}, strategy="test"),
+            "javascript": ClusterResult(clusters={2: set(js_names)}, strategy="test"),
+        }
+        static = MagicMock()
+        static.get_cfg.side_effect = {"python": py_cfg, "javascript": js_cfg}.__getitem__
+        mixin = MockMixin(repo_dir=Path("/repo"), static_analysis=static)
+
+        full = mixin._render_cluster_string([Language.PYTHON, Language.JAVASCRIPT], cluster_results, None, {}).text
+        desired_budget = len(full) + 10
+        input_tokens = int(desired_budget / (ClusterPromptBudget(input_tokens=0).chars_per_token * 0.9)) + 8_001
+
+        with (
+            patch(
+                "agents.cluster_methods_mixin.get_current_agent_context_window",
+                return_value=ContextWindow(input_tokens=input_tokens, output_tokens=64_000),
+            ),
+            patch("agents.cluster_methods_mixin.plan_skip_set") as mock_plan_skip,
+        ):
+            result = mixin._build_cluster_string([Language.PYTHON, Language.JAVASCRIPT], cluster_results)
+
+        self.assertEqual(result, full)
+        mock_plan_skip.assert_not_called()
 
 
 class TestExpandToMethodLevelClusters(unittest.TestCase):

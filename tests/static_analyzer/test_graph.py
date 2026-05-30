@@ -411,19 +411,52 @@ class TestCallGraph(unittest.TestCase):
 
         nx_graph = graph.to_networkx()
 
-        # Define communities
+        # Define communities as (cluster_id, members) pairs
         communities = [
-            ["module.func0", "module.func1"],
-            ["module.func2", "module.func3"],
+            (1, {"module.func0", "module.func1"}),
+            (2, {"module.func2", "module.func3"}),
         ]
 
         graph_instance = CallGraph()
-        result = graph_instance._CallGraph__cluster_str(communities, nx_graph)  # type: ignore[attr-defined]
+        result = graph_instance._CallGraph__cluster_str(communities, nx_graph, set())  # type: ignore[attr-defined]
 
         self.assertIn("Cluster Definitions", result)
         self.assertIn("Inter-Cluster Connections", result)
         self.assertIn("Cluster 1", result)
         self.assertIn("Cluster 2", result)
+
+    def test_cluster_str_prefix_factoring(self):
+        graph = CallGraph()
+
+        nodes = [
+            Node("pkg.sub.module.ClassA", NodeType.CLASS, "/pkg/sub/module.py", 1, 5),
+            Node("pkg.sub.module.ClassA.method_one", NodeType.METHOD, "/pkg/sub/module.py", 6, 10),
+            Node("pkg.sub.module.ClassA.method_two", NodeType.METHOD, "/pkg/sub/module.py", 11, 15),
+            Node("pkg.sub.module.helper_func", NodeType.FUNCTION, "/pkg/sub/module.py", 16, 20),
+            Node("other.Outside", NodeType.CLASS, "/other.py", 1, 5),
+        ]
+        for n in nodes:
+            graph.add_node(n)
+        graph.add_edge("pkg.sub.module.ClassA.method_one", "pkg.sub.module.helper_func")
+
+        nx_graph = graph.to_networkx()
+        communities = [(1, {n.fully_qualified_name for n in nodes[:4]}), (2, {"other.Outside"})]
+
+        result = graph._CallGraph__cluster_str(communities, nx_graph, set())  # type: ignore[attr-defined]
+
+        self.assertIn('(identifiers below prefixed with "pkg.sub.module.")', result)
+        self.assertIn("ClassA [Class]", result)
+        self.assertIn("helper_func [Function]", result)
+        # Full FQN must not appear inside the factored file block
+        self.assertNotIn("    pkg.sub.module.ClassA [Class]", result)
+
+    def test_common_dot_prefix(self):
+        self.assertEqual(CallGraph._common_dot_prefix([]), "")
+        self.assertEqual(CallGraph._common_dot_prefix(["a.b.c"]), "")
+        self.assertEqual(CallGraph._common_dot_prefix(["a.b.c", "a.b.d"]), "a.b")
+        self.assertEqual(CallGraph._common_dot_prefix(["a.b.c", "x.y.z"]), "")
+        # Prevents collapsing identical names to empty short form
+        self.assertEqual(CallGraph._common_dot_prefix(["a.b", "a.b"]), "a")
 
     def test_non_cluster_str_static_method(self):
         # Test __non_cluster_str static method
@@ -443,7 +476,7 @@ class TestCallGraph(unittest.TestCase):
         top_nodes = {"module.func0", "module.func1"}
 
         graph_instance = CallGraph()
-        result = graph_instance._CallGraph__non_cluster_str(nx_graph, top_nodes)  # type: ignore[attr-defined]
+        result = graph_instance._CallGraph__non_cluster_str(nx_graph, top_nodes, set())  # type: ignore[attr-defined]
 
         # Should show edges involving func2 and func3
         self.assertIn("module.func2", result)
@@ -654,6 +687,107 @@ class TestCallGraph(unittest.TestCase):
         self.assertEqual(result1.clusters.keys(), result2.clusters.keys())
         for cid in result1.clusters:
             self.assertEqual(result1.clusters[cid], result2.clusters[cid])
+
+    def test_node_promotion_with_existing_edges(self):
+        """Promoting a node (longer name replaces shorter) after edges exist must not break the graph.
+
+        Simulates the monorepo merge path where nodes from a second subproject are
+        added to a CFG that already has edges from the first subproject.
+        """
+        graph = CallGraph()
+
+        short = Node("index.funcA", NodeType.FUNCTION, "/src/index.py", 1, 10)
+        other = Node("index.funcB", NodeType.FUNCTION, "/src/index.py", 20, 30)
+        graph.add_node(short)
+        graph.add_node(other)
+        graph.add_edge("index.funcA", "index.funcB")
+
+        # Longer qualified name for the same symbol arrives
+        graph.add_node(Node("src.index.funcA", NodeType.FUNCTION, "/src/index.py", 1, 10))
+
+        self.assertIn("src.index.funcA", graph.nodes)
+        self.assertNotIn("index.funcA", graph.nodes)
+
+        # Edge objects must reflect the promoted name (in-place mutation)
+        nx_graph = graph.to_networkx()
+        self.assertEqual(nx_graph.number_of_edges(), 1)
+
+        # filter_by_files must not KeyError on stale edge names
+        sub = graph.filter_by_files({"/src/index.py"})
+        self.assertGreaterEqual(len(sub.edges), 1)
+
+        # _edge_set must have been rewritten so dedup still works
+        graph.add_edge("src.index.funcA", "index.funcB")
+        self.assertEqual(len(graph.edges), 1)
+
+    def test_target_promotion_updates_methods_called_by_me(self):
+        graph = CallGraph()
+        caller = Node("mod.caller", NodeType.FUNCTION, "/a.py", 1, 10)
+        target = Node("funcB", NodeType.FUNCTION, "/b.py", 1, 10)
+        graph.add_node(caller)
+        graph.add_node(target)
+        graph.add_edge("mod.caller", "funcB")
+
+        self.assertIn("funcB", graph.nodes["mod.caller"].methods_called_by_me)
+
+        # Promote the target to a longer canonical name
+        graph.add_node(Node("pkg.mod.funcB", NodeType.FUNCTION, "/b.py", 1, 10))
+
+        self.assertIn("pkg.mod.funcB", graph.nodes["mod.caller"].methods_called_by_me)
+        self.assertNotIn("funcB", graph.nodes["mod.caller"].methods_called_by_me)
+
+    def test_alias_resolution_and_has_node(self):
+        """Aliases must resolve to canonical in both add order directions, and has_node must find them."""
+        graph = CallGraph()
+
+        # Shortest-first: 3 names for the same symbol
+        graph.add_node(Node("funcA", NodeType.FUNCTION, "/src/index.py", 1, 10))
+        graph.add_node(Node("src.index.funcA", NodeType.FUNCTION, "/src/index.py", 1, 10))
+        graph.add_node(Node("container.src.index.funcA", NodeType.FUNCTION, "/src/index.py", 1, 10))
+
+        self.assertEqual(len(graph.nodes), 1)
+        self.assertIn("container.src.index.funcA", graph.nodes)
+
+        # has_node must find all aliases
+        self.assertTrue(graph.has_node("funcA"))
+        self.assertTrue(graph.has_node("src.index.funcA"))
+
+        # Edges via any alias must resolve to canonical
+        graph.add_node(Node("other.func", NodeType.FUNCTION, "/src/other.py", 1, 10))
+        graph.add_edge("funcA", "other.func")
+        self.assertEqual(graph.edges[0].get_source(), "container.src.index.funcA")
+        graph.add_edge("src.index.funcA", "other.func")
+        self.assertEqual(len(graph.edges), 1)  # deduped
+
+        # Longest-first: separate symbol
+        graph2 = CallGraph()
+        graph2.add_node(Node("pkg.mod.bar", NodeType.FUNCTION, "/bar.py", 1, 10))
+        graph2.add_node(Node("mod.bar", NodeType.FUNCTION, "/bar.py", 1, 10))
+        graph2.add_node(Node("bar", NodeType.FUNCTION, "/bar.py", 1, 10))
+
+        self.assertEqual(len(graph2.nodes), 1)
+        self.assertIn("pkg.mod.bar", graph2.nodes)
+        self.assertTrue(graph2.has_node("bar"))
+
+
+class TestDetectCommunitiesDeterminism(unittest.TestCase):
+    """Property test: same input + same seed -> byte-equal output.
+
+    Why: ``detect_communities`` is the entry point for both incremental and
+    full clustering. Determinism is the contract every downstream piece
+    relies on (cluster IDs persisted in analysis.json must reproduce on
+    subsequent runs of the same code).
+    """
+
+    def test_detect_communities_is_deterministic(self):
+        from static_analyzer.graph import detect_communities
+
+        g = nx.karate_club_graph()
+        a: list[set[int]] = detect_communities(g, seed=42)
+        b: list[set[int]] = detect_communities(g, seed=42)
+        canon_a = sorted(sorted(c) for c in a)
+        canon_b = sorted(sorted(c) for c in b)
+        self.assertEqual(canon_a, canon_b)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def _write_analysis_file(path: Path) -> Path:
 
 
 class TestGenerateMarkdown(unittest.TestCase):
-    @patch("github_action.generate_markdown_file")
+    @patch("codeboarding_workflows.rendering.generate_markdown_file")
     def test_generate_markdown_with_analysis_file(self, mock_generate_file):
         # Test markdown generation with a unified analysis file
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -54,7 +54,7 @@ class TestGenerateMarkdown(unittest.TestCase):
             self.assertEqual(args[0][0], "overview")
             self.assertEqual(args[1]["repo_ref"], "https://github.com/test/repo/blob/main/.codeboarding")
 
-    @patch("github_action.generate_markdown_file")
+    @patch("codeboarding_workflows.rendering.generate_markdown_file")
     def test_generate_markdown_with_components(self, mock_generate_file):
         # Test with components that produce multiple entries
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -109,7 +109,7 @@ class TestGenerateMarkdown(unittest.TestCase):
 
 
 class TestGenerateHtml(unittest.TestCase):
-    @patch("github_action.generate_html_file")
+    @patch("codeboarding_workflows.rendering.generate_html_file")
     def test_generate_html_with_analysis_file(self, mock_generate_file):
         # Test HTML generation with a unified analysis file
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -132,7 +132,7 @@ class TestGenerateHtml(unittest.TestCase):
 
 
 class TestGenerateMdx(unittest.TestCase):
-    @patch("github_action.generate_mdx_file")
+    @patch("codeboarding_workflows.rendering.generate_mdx_file")
     def test_generate_mdx_with_analysis_file(self, mock_generate_file):
         # Test MDX generation with a unified analysis file
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -156,7 +156,7 @@ class TestGenerateMdx(unittest.TestCase):
 
 
 class TestGenerateRst(unittest.TestCase):
-    @patch("github_action.generate_rst_file")
+    @patch("codeboarding_workflows.rendering.generate_rst_file")
     def test_generate_rst_with_analysis_file(self, mock_generate_file):
         # Test RST generation with a unified analysis file
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -181,6 +181,7 @@ class TestGenerateRst(unittest.TestCase):
 
 class TestGenerateAnalysis(unittest.TestCase):
     @patch("github_action.generate_markdown")
+    @patch("github_action.run_incremental_workflow")
     @patch("github_action.DiagramGenerator")
     @patch("github_action.create_temp_repo_folder")
     @patch("github_action.checkout_repo")
@@ -192,6 +193,7 @@ class TestGenerateAnalysis(unittest.TestCase):
         mock_checkout,
         mock_create_temp,
         mock_generator_class,
+        mock_workflow,
         mock_generate_markdown,
     ):
         # Test analysis generation with markdown output
@@ -204,8 +206,8 @@ class TestGenerateAnalysis(unittest.TestCase):
 
             # Mock generator
             mock_generator = MagicMock()
-            mock_generator.generate_analysis_smart.return_value = temp_path / "analysis.json"
             mock_generator_class.return_value = mock_generator
+            mock_workflow.return_value = temp_path / "analysis.json"
 
             result = generate_analysis(
                 repo_url="https://github.com/test/repo",
@@ -237,6 +239,7 @@ class TestGenerateAnalysis(unittest.TestCase):
             self.assertEqual(result, temp_path)
 
     @patch("github_action.generate_html")
+    @patch("github_action.run_incremental_workflow")
     @patch("github_action.DiagramGenerator")
     @patch("github_action.create_temp_repo_folder")
     @patch("github_action.checkout_repo")
@@ -248,6 +251,7 @@ class TestGenerateAnalysis(unittest.TestCase):
         mock_checkout,
         mock_create_temp,
         mock_generator_class,
+        mock_workflow,
         mock_generate_html,
     ):
         # Test analysis generation with HTML output
@@ -257,8 +261,8 @@ class TestGenerateAnalysis(unittest.TestCase):
             mock_clone.return_value = "test_repo"
 
             mock_generator = MagicMock()
-            mock_generator.generate_analysis_smart.return_value = temp_path / "analysis.json"
             mock_generator_class.return_value = mock_generator
+            mock_workflow.return_value = temp_path / "analysis.json"
 
             result = generate_analysis(
                 repo_url="https://github.com/test/repo",
@@ -272,6 +276,7 @@ class TestGenerateAnalysis(unittest.TestCase):
             self.assertEqual(result, temp_path)
 
     @patch("github_action.generate_mdx")
+    @patch("github_action.run_incremental_workflow")
     @patch("github_action.DiagramGenerator")
     @patch("github_action.create_temp_repo_folder")
     @patch("github_action.checkout_repo")
@@ -283,6 +288,7 @@ class TestGenerateAnalysis(unittest.TestCase):
         mock_checkout,
         mock_create_temp,
         mock_generator_class,
+        mock_workflow,
         mock_generate_mdx,
     ):
         # Test analysis generation with MDX output
@@ -292,8 +298,8 @@ class TestGenerateAnalysis(unittest.TestCase):
             mock_clone.return_value = "test_repo"
 
             mock_generator = MagicMock()
-            mock_generator.generate_analysis_smart.return_value = temp_path / "analysis.json"
             mock_generator_class.return_value = mock_generator
+            mock_workflow.return_value = temp_path / "analysis.json"
 
             result = generate_analysis(
                 repo_url="https://github.com/test/repo",
@@ -307,6 +313,7 @@ class TestGenerateAnalysis(unittest.TestCase):
             self.assertEqual(result, temp_path)
 
     @patch("github_action.generate_rst")
+    @patch("github_action.run_incremental_workflow")
     @patch("github_action.DiagramGenerator")
     @patch("github_action.create_temp_repo_folder")
     @patch("github_action.checkout_repo")
@@ -318,6 +325,7 @@ class TestGenerateAnalysis(unittest.TestCase):
         mock_checkout,
         mock_create_temp,
         mock_generator_class,
+        mock_workflow,
         mock_generate_rst,
     ):
         # Test analysis generation with RST output
@@ -327,8 +335,8 @@ class TestGenerateAnalysis(unittest.TestCase):
             mock_clone.return_value = "test_repo"
 
             mock_generator = MagicMock()
-            mock_generator.generate_analysis_smart.return_value = temp_path / "analysis.json"
             mock_generator_class.return_value = mock_generator
+            mock_workflow.return_value = temp_path / "analysis.json"
 
             result = generate_analysis(
                 repo_url="https://github.com/test/repo",
@@ -341,6 +349,7 @@ class TestGenerateAnalysis(unittest.TestCase):
             mock_generate_rst.assert_called_once()
             self.assertEqual(result, temp_path)
 
+    @patch("github_action.run_incremental_workflow")
     @patch("github_action.DiagramGenerator")
     @patch("github_action.create_temp_repo_folder")
     @patch("github_action.checkout_repo")
@@ -352,6 +361,7 @@ class TestGenerateAnalysis(unittest.TestCase):
         mock_checkout,
         mock_create_temp,
         mock_generator_class,
+        mock_workflow,
     ):
         # Test with unsupported extension
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -360,8 +370,8 @@ class TestGenerateAnalysis(unittest.TestCase):
             mock_clone.return_value = "test_repo"
 
             mock_generator = MagicMock()
-            mock_generator.generate_analysis_smart.return_value = temp_path / "analysis.json"
             mock_generator_class.return_value = mock_generator
+            mock_workflow.return_value = temp_path / "analysis.json"
 
             with self.assertRaises(ValueError) as context:
                 generate_analysis(
@@ -375,6 +385,7 @@ class TestGenerateAnalysis(unittest.TestCase):
             self.assertIn("Unsupported extension", str(context.exception))
 
     @patch("github_action.generate_markdown")
+    @patch("github_action.run_incremental_workflow")
     @patch("github_action.DiagramGenerator")
     @patch("github_action.create_temp_repo_folder")
     @patch("github_action.checkout_repo")
@@ -386,6 +397,7 @@ class TestGenerateAnalysis(unittest.TestCase):
         mock_checkout,
         mock_create_temp,
         mock_generator_class,
+        mock_workflow,
         mock_generate_markdown,
     ):
         # Test that branch checkout is called with correct branch
@@ -396,8 +408,8 @@ class TestGenerateAnalysis(unittest.TestCase):
             mock_clone.return_value = "test_repo"
 
             mock_generator = MagicMock()
-            mock_generator.generate_analysis_smart.return_value = temp_path / "analysis.json"
             mock_generator_class.return_value = mock_generator
+            mock_workflow.return_value = temp_path / "analysis.json"
 
             generate_analysis(
                 repo_url="https://github.com/test/repo",

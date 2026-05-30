@@ -8,13 +8,14 @@ import platform
 import tempfile
 from pathlib import Path
 
+from static_analyzer.constants import Language, NodeType
 from static_analyzer.engine.language_adapter import LanguageAdapter
-from static_analyzer.constants import NodeType
 from static_analyzer.engine.lsp_constants import (
     CALLABLE_KINDS,
     CLASS_LIKE_KINDS,
     EdgeStrategy,
 )
+from static_analyzer.engine.utils import total_ram_gb
 from static_analyzer.java_utils import create_jdtls_command, find_java_21_or_later
 from utils import get_config
 
@@ -24,12 +25,20 @@ logger = logging.getLogger(__name__)
 class JavaAdapter(LanguageAdapter):
 
     @property
+    def wait_for_workspace_ready(self) -> bool:
+        """JDTLS finishes project import asynchronously and only signals
+        readiness via ``language/status`` (``ProjectStatus OK``); cross-file
+        queries return empty until then.
+        """
+        return True
+
+    @property
     def language(self) -> str:
         return "Java"
 
     @property
-    def file_extensions(self) -> tuple[str, ...]:
-        return (".java",)
+    def language_enum(self) -> Language:
+        return Language.JAVA
 
     @property
     def lsp_command(self) -> list[str]:
@@ -114,16 +123,12 @@ class JavaAdapter(LanguageAdapter):
         else:
             desired_gb = 8
 
-        # Cap at 50% of available physical memory
-        try:
-            total_ram_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-            total_ram_gb = total_ram_bytes / (1024**3)
-            max_heap_gb = max(1, int(total_ram_gb * 0.5))
-            desired_gb = min(desired_gb, max_heap_gb)
-        except (ValueError, OSError):
-            pass  # os.sysconf not available (e.g. Windows) — use file-count estimate as-is
+        # Cap at 50% of available physical memory.
+        ram_gb = total_ram_gb()
+        if ram_gb is not None:
+            desired_gb = min(desired_gb, int(ram_gb * 0.5))
 
-        return f"{desired_gb}G"
+        return f"{max(1, desired_gb)}G"
 
     def build_qualified_name(
         self,

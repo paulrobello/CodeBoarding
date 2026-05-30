@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -9,8 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from agents.abstraction_agent import AbstractionAgent
-from agents.agent_responses import AnalysisInsights, Component
+from agents.agent_responses import AnalysisInsights, Component, MetaAnalysisInsights, MethodEntry
 from agents.details_agent import DetailsAgent
+from agents.incremental_agent import (
+    IncrementalAgent,
+    prune_empty_components,
+    repopulate_touched_scopes,
+    remove_deleted_files,
+    stitch_delta,
+)
 from agents.llm_config import initialize_llms
 from agents.meta_agent import MetaAgent
 from agents.planner_agent import get_expandable_components
@@ -19,29 +27,46 @@ from diagram_analysis.analysis_json import (
     FileCoverageSummary,
     NotAnalyzedFile,
 )
+from diagram_analysis.cluster_delta import compute_cluster_delta
+from diagram_analysis.cluster_snapshot import snapshot_from_static_analysis
+from diagram_analysis.exceptions import IncrementalCacheMissingError
 from diagram_analysis.file_coverage import FileCoverage
-from static_analyzer.cluster_relations import build_global_relations
-from diagram_analysis.io_utils import load_full_analysis, save_analysis, save_sub_analysis
-from diagram_analysis.manifest import (
-    build_manifest_from_analysis,
-    save_manifest,
-)
+from diagram_analysis.io_utils import load_full_analysis, normalize_repo_path, save_analysis, save_sub_analysis
 from diagram_analysis.version import Version
+
 from health.config import initialize_health_dir, load_health_config
 from health.runner import run_health_checks
 from monitoring import StreamingStatsWriter
 from monitoring.mixin import MonitoringMixin
 from monitoring.paths import get_monitoring_run_dir
-from repo_utils import get_git_commit_hash, get_repo_state_hash
-from repo_utils.change_detector import ChangeSet, detect_uncommitted_changes
+from repo_utils import get_git_commit_hash
+from repo_utils.change_detector import ChangeSet
 from repo_utils.ignore import RepoIgnoreManager
-from repo_utils.method_diff import apply_method_diffs_to_file_index
 from static_analyzer import StaticAnalyzer, get_static_analysis
+from static_analyzer.analysis_cache import StaticAnalysisCache
 from static_analyzer.analysis_result import StaticAnalysisResults
+from static_analyzer.cluster_relations import build_global_relations
+from static_analyzer.constants import Language
+from static_analyzer.graph import ClusterResult
 from static_analyzer.scanner import ProjectScanner
-from utils import get_cache_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _component_depth(component_id: str | None) -> int:
+    """Return the absolute diagram depth for a hierarchical component id."""
+    if not component_id:
+        return 1
+    return component_id.count(".") + 1
+
+
+def _component_expansion_seeds(components: list[Component], max_depth: int) -> list[tuple[Component, int]]:
+    """Return components that may still be expanded, paired with absolute depth."""
+    return [
+        (component, depth)
+        for component in components
+        if (depth := _component_depth(component.component_id)) < max_depth
+    ]
 
 
 class DiagramGenerator:
@@ -57,6 +82,7 @@ class DiagramGenerator:
         project_name: str | None = None,
         monitoring_enabled: bool = False,
         static_analyzer: StaticAnalyzer | None = None,
+        changes: ChangeSet | None = None,
     ):
         self.repo_location = repo_location
         self.temp_folder = temp_folder
@@ -68,74 +94,30 @@ class DiagramGenerator:
         self.log_path = log_path
         self.monitoring_enabled = monitoring_enabled
         self.force_full_analysis = False  # Set to True to skip incremental updates
-        # Optional pre-started StaticAnalyzer injected by long-lived callers (e.g. the
-        # wrapper). When set, pre_analysis() uses it directly instead of creating a new
-        # one-shot analyzer via get_static_analysis().
+        # Source-tree changeset for the iterative path. When set, the cluster
+        # delta drops drift qnames whose file is outside the diff AND outside
+        # the prior analysis (see ``compute_cluster_delta``). ``None`` runs
+        # unscoped (no drift filtering).
+        self.changes: ChangeSet | None = changes
+        # Optional canonical source-state identifier (e.g. a git tree SHA
+        # over HEAD + dirty overlay), stamped into the pkl's sibling .sha
+        # file as the diff base for the next warm-start. Used by Core's
+        # ``_update_cached_results`` to compute "what files changed since
+        # this pkl was saved" — NOT a cache gate. Set externally —
+        # typically by the wrapper, which has the snapshot's tree SHA
+        # at run-prepare time. ``None`` is a tag-less save.
+        self.source_sha: str | None = None
         self._static_analyzer = static_analyzer
 
         self.details_agent: DetailsAgent | None = None
         self.static_analysis: StaticAnalysisResults | None = None  # Cache static analysis for reuse
         self.abstraction_agent: AbstractionAgent | None = None
         self.meta_agent: MetaAgent | None = None
-        self.meta_context: Any | None = None
+        self.meta_context: MetaAnalysisInsights | None = None
         self.file_coverage_data: dict | None = None
 
         self._monitoring_agents: dict[str, MonitoringMixin] = {}
         self.stats_writer: StreamingStatsWriter | None = None
-        self._cached_method_changes = ChangeSet()
-        self._method_change_resolution_attempted = False
-
-    def _resolve_method_level_changes(self) -> ChangeSet:
-        """Resolve method-level changes by detecting uncommitted changes (staged + unstaged).
-
-        This diffs HEAD against the working tree to find files with uncommitted modifications,
-        which is the source of truth for method status assignment during analysis.
-        """
-        if self._method_change_resolution_attempted:
-            return self._cached_method_changes
-
-        self._method_change_resolution_attempted = True
-
-        changes = detect_uncommitted_changes(self.repo_location)
-        if changes.is_empty():
-            logger.debug("No uncommitted changes detected; method statuses remain unchanged")
-            return self._cached_method_changes
-
-        self._cached_method_changes = changes
-        return changes
-
-    def _apply_method_diff_statuses(
-        self,
-        root_analysis: AnalysisInsights,
-        sub_analyses: dict[str, AnalysisInsights],
-    ) -> None:
-        """Annotate file/method status fields using working-tree git diffs."""
-        changes = self._resolve_method_level_changes()
-        if changes.is_empty():
-            return
-
-        apply_method_diffs_to_file_index(root_analysis.files, changes, self.repo_location)
-        self._sync_component_statuses_from_files_index(root_analysis)
-
-        for sub_analysis in sub_analyses.values():
-            apply_method_diffs_to_file_index(sub_analysis.files, changes, self.repo_location)
-            self._sync_component_statuses_from_files_index(sub_analysis)
-
-    @staticmethod
-    def _sync_component_statuses_from_files_index(analysis: AnalysisInsights) -> None:
-        """Copy file/method statuses from analysis.files into component.file_methods."""
-        for component in analysis.components:
-            for file_group in component.file_methods:
-                file_entry = analysis.files.get(file_group.file_path)
-                if file_entry is None:
-                    continue
-
-                file_group.file_status = file_entry.file_status
-                method_statuses = {method.qualified_name: method.status for method in file_entry.methods}
-                for method in file_group.methods:
-                    status = method_statuses.get(method.qualified_name)
-                    if status is not None:
-                        method.status = status
 
     def process_component(
         self, component: Component
@@ -177,6 +159,28 @@ class DiagramGenerator:
         else:
             logger.warning("Health checks skipped: no languages found in static analysis results")
 
+    def _strip_ignored(
+        self,
+        analysis: AnalysisInsights,
+        sub_analyses: dict[str, AnalysisInsights] | None = None,
+    ) -> None:
+        """Sweep ``.codeboardingignore``-matched files out of the rendered tree.
+
+        Single chokepoint applied right before every ``save_analysis(...)`` so
+        the serialized architecture honors the user's ignore rules, regardless
+        of which discovery path (LSP imports, agent clustering, plugin) added
+        a file. Other layers (file_monitor, file_coverage, function_size)
+        already use ``RepoIgnoreManager``; this extends the same authority to
+        the analyzer's persisted output.
+
+        Idempotent. Mutates in place. Empty components are kept (relations may
+        reference them); downstream renderers handle zero-method components.
+        """
+        ignore_manager = RepoIgnoreManager(self.repo_location)
+        ignore_manager.strip_ignored(analysis)
+        for sub in (sub_analyses or {}).values():
+            ignore_manager.strip_ignored(sub)
+
     def _build_file_coverage(self, scanner: ProjectScanner, static_analysis: StaticAnalysisResults) -> dict:
         """Build file coverage data comparing all text files against analyzed files."""
         ignore_manager = RepoIgnoreManager(self.repo_location)
@@ -207,14 +211,42 @@ class DiagramGenerator:
         logger.info(f"File coverage report written to {coverage_path}")
 
     def _get_static_from_injected_analyzer(
-        self, cache_dir: Path | None, skip_cache: bool = False
+        self,
+        skip_cache: bool = False,
+        source_sha: str | None = None,
     ) -> StaticAnalysisResults:
         result = self._static_analyzer.analyze(  # type: ignore[union-attr]
-            cache_dir=cache_dir,
             skip_cache=skip_cache,
+            source_sha=source_sha,
+            cache_dir=self.output_dir,
         )
         result.diagnostics = self._static_analyzer.collected_diagnostics  # type: ignore[union-attr]
         return result
+
+    def _seed_incremental_cluster_cache(self, cluster_results: dict[str, ClusterResult]) -> None:
+        """Write post-delta ``cluster_results`` into each language CFG's ``_cluster_cache``.
+
+        On the incremental path the abstraction agent doesn't run, so the live
+        partition has to be plumbed in explicitly before ``stop_clients`` saves
+        the pkl. ``cluster_snapshot`` reads exclusively from this cache.
+        """
+        if self.static_analysis is None:
+            return
+        for language, cr in cluster_results.items():
+            try:
+                cfg = self.static_analysis.get_cfg(Language(language))
+            except (ValueError, KeyError):
+                continue
+            cfg._cluster_cache = cr
+
+    def _persist_static_analysis_artifact(self) -> None:
+        """Persist the post-clustering static-analysis artifact."""
+        if self._static_analyzer is not None:
+            self._static_analyzer.flush_cache()
+            return
+        if self.static_analysis is None:
+            return
+        StaticAnalysisCache(self.output_dir, self.repo_location).save(self.static_analysis, source_sha=self.source_sha)
 
     def pre_analysis(self):
         analysis_start_time = time.time()
@@ -232,14 +264,27 @@ class DiagramGenerator:
         self._monitoring_agents["MetaAgent"] = self.meta_agent
 
         def get_static_with_injected_analyzer() -> StaticAnalysisResults:
-            cache_dir = None if self.force_full_analysis else get_cache_dir(self.repo_location)
-            return self._get_static_from_injected_analyzer(cache_dir, skip_cache=self.force_full_analysis)
+            # ``CODEBOARDING_DISABLE_CACHE_REUSE=1`` is the post-deploy kill
+            # switch that reverts to "always re-LSP everything" without a code
+            # change; useful if telemetry surfaces a warm-start regression.
+            disable_reuse = os.getenv("CODEBOARDING_DISABLE_CACHE_REUSE", "").lower() in ("1", "true", "yes")
+            skip_cache = self.force_full_analysis or disable_reuse
+            if self.force_full_analysis:
+                logger.info("Force full analysis: skipping static analysis cache")
+            if disable_reuse:
+                logger.info("CODEBOARDING_DISABLE_CACHE_REUSE set; skipping static analysis cache")
+            return self._get_static_from_injected_analyzer(skip_cache=skip_cache, source_sha=self.source_sha)
 
         def get_static_with_new_analyzer() -> StaticAnalysisResults:
             skip_cache = self.force_full_analysis
             if skip_cache:
                 logger.info("Force full analysis: skipping static analysis cache")
-            return get_static_analysis(self.repo_location, skip_cache=skip_cache)
+            return get_static_analysis(
+                self.repo_location,
+                skip_cache=skip_cache,
+                source_sha=self.source_sha,
+                cache_dir=self.output_dir,
+            )
 
         # Decide how to obtain static analysis results, then run it in parallel
         # with the meta-context computation so neither blocks the other.
@@ -258,6 +303,7 @@ class DiagramGenerator:
             meta_context = meta_future.result()
 
         self.static_analysis = static_analysis
+        self.meta_context = meta_context
 
         # --- Capture Static Analysis Stats ---
         static_stats: dict[str, Any] = {"repo_name": self.repo_name, "languages": {}}
@@ -328,11 +374,12 @@ class DiagramGenerator:
         analysis: AnalysisInsights,
         root_components: list[Component],
     ) -> tuple[list[Component], dict[str, AnalysisInsights]]:
-        """Generate subcomponents for the given root-level analysis using a frontier queue."""
+        """Generate subcomponents using absolute component depth and a frontier queue."""
         max_workers = min(os.cpu_count() or 4, 8)
 
         expanded_components: list[Component] = []
         sub_analyses: dict[str, AnalysisInsights] = {}
+        commit_hash = get_git_commit_hash(self.repo_location)
 
         # Group stats to avoid cluttering the local variable scope
         stats = {"submitted": 0, "completed": 0, "saves": 0, "errors": 0}
@@ -347,9 +394,8 @@ class DiagramGenerator:
                 logger.debug("Submitted component='%s' at level=%d", comp.name, lvl)
 
             # 1. Initial Seeding
-            if self.depth_level > 1:
-                for component in root_components:
-                    submit_component(component, 1)
+            for component, level in _component_expansion_seeds(root_components, self.depth_level):
+                submit_component(component, level)
 
             logger.info(
                 "Subcomponent generation started with %d workers. Initial tasks: %d", max_workers, stats["submitted"]
@@ -372,11 +418,13 @@ class DiagramGenerator:
                             stats["saves"] += 1
 
                             logger.debug("Saving intermediate analysis for '%s'", comp_name)
+                            self._strip_ignored(analysis, sub_analyses)
                             save_analysis(
                                 analysis=analysis,
                                 output_dir=Path(self.output_dir),
                                 sub_analyses=sub_analyses,
                                 repo_name=self.repo_name,
+                                commit_hash=commit_hash,
                             )
 
                         if new_components and level + 1 < self.depth_level:
@@ -400,68 +448,6 @@ class DiagramGenerator:
 
         return expanded_components, sub_analyses
 
-    def expand_component(
-        self,
-        component: Component,
-    ) -> tuple[AnalysisInsights, list[Component]] | None:
-        """Expand a single component: run detail analysis, save, and rebuild global relations.
-
-        This is the shared path for both CLI partial updates and IDE expand operations.
-        The caller is responsible for loading the analysis and finding the component.
-
-        Returns (sub_analysis, new_components) on success, None on failure.
-        """
-        if self.details_agent is None or self.abstraction_agent is None:
-            self.pre_analysis()
-
-        comp_id, sub_analysis, new_components = self.process_component(component)
-        if comp_id is None or sub_analysis is None:
-            logger.error("Failed to generate sub-analysis for component '%s'", component.component_id)
-            return None
-
-        output_dir = Path(self.output_dir)
-        save_sub_analysis(sub_analysis, output_dir, component.component_id)
-        logger.info("Saved sub-analysis for component '%s'", component.component_id)
-
-        # Rebuild global cross-boundary relations so the new sub-components
-        # get proper edges to components outside their parent's scope.
-        updated = load_full_analysis(output_dir)
-        if updated:
-            updated_root, updated_subs = updated
-            global_relations = self.rebuild_global_relations(updated_root, updated_subs)
-            if global_relations:
-                save_analysis(
-                    analysis=updated_root,
-                    output_dir=output_dir,
-                    sub_analyses=updated_subs,
-                    repo_name=self.repo_name,
-                )
-                logger.info("Rebuilt %d global relations after expanding '%s'", len(global_relations), comp_id)
-
-        return sub_analysis, new_components
-
-    def rebuild_global_relations(
-        self,
-        root_analysis: AnalysisInsights,
-        sub_analyses: dict[str, AnalysisInsights],
-    ) -> list:
-        """Rebuild cross-boundary relations using the full CFG.
-
-        Computes a global node-to-deepest-component-id map so that relations
-        like "2.1" -> "3.5.2" (across parent scopes) are discovered.
-
-        Mutates ``root_analysis.components_relations`` in place and returns
-        the new relations list.  Returns an empty list when static analysis
-        data is not available.
-        """
-        if not self.static_analysis:
-            return []
-
-        cfg_graphs = {lang: self.static_analysis.get_cfg(lang) for lang in self.static_analysis.get_languages()}
-        global_relations = build_global_relations(root_analysis, sub_analyses, cfg_graphs)
-        root_analysis.components_relations = global_relations
-        return global_relations
-
     def generate_analysis(self) -> Path:
         """
         Generate the graph analysis for the given repository.
@@ -480,7 +466,6 @@ class DiagramGenerator:
             assert self.abstraction_agent is not None
 
             analysis, cluster_results = self.abstraction_agent.run()
-
             # Get the initial components to analyze (deterministic, no LLM)
             root_components = get_expandable_components(analysis)
             logger.info(f"Found {len(root_components)} components to analyze at level 1")
@@ -488,34 +473,26 @@ class DiagramGenerator:
             # Process components using a frontier queue: submit children as soon as parent finishes.
             expanded_components, sub_analyses = self._generate_subcomponents(analysis, root_components)
 
-            # Build global cross-boundary relations at the deepest available granularity.
-            # This uses the full CFG with a global node->deepest_component_id map to find
-            # relations like "2.1" -> "3.5.2" that per-level analysis cannot see.
+            # Replace per-level LLM relations with the global cross-boundary set
+            # built from the full CFG so deep edges like ``1.1.1 -> 2.1.2`` survive
+            # at the deepest available granularity.
             if sub_analyses:
                 global_relations = self.rebuild_global_relations(analysis, sub_analyses)
                 if global_relations:
-                    logger.info(f"Replaced per-level relations with {len(global_relations)} global relations")
+                    logger.info(
+                        "Replaced per-level relations with %d global cross-boundary relations",
+                        len(global_relations),
+                    )
 
-            # Build file coverage summary for metadata
-            file_coverage_summary = None
-            if self.file_coverage_data:
-                s = self.file_coverage_data["summary"]
-                file_coverage_summary = FileCoverageSummary(
-                    total_files=s["total_files"],
-                    analyzed=s["analyzed"],
-                    not_analyzed=s["not_analyzed"],
-                    not_analyzed_by_reason=s["not_analyzed_by_reason"],
-                )
-
-            # Final write of unified analysis.json
-            self._apply_method_diff_statuses(analysis, sub_analyses)
-
+            commit_hash = get_git_commit_hash(self.repo_location)
+            self._strip_ignored(analysis, sub_analyses)
             analysis_path = save_analysis(
                 analysis=analysis,
                 output_dir=Path(self.output_dir),
                 sub_analyses=sub_analyses,
                 repo_name=self.repo_name,
-                file_coverage_summary=file_coverage_summary,
+                file_coverage_summary=self._build_file_coverage_summary(),
+                commit_hash=commit_hash,
             ).resolve()
 
             logger.info(f"Analysis complete. Written unified analysis to {analysis_path}")
@@ -523,31 +500,336 @@ class DiagramGenerator:
             # Write file_coverage.json
             self._write_file_coverage()
 
-            # Save manifest for incremental updates
-            self._save_manifest(analysis, expanded_components)
+            self._persist_static_analysis_artifact()
 
             return analysis_path
 
-    def _save_manifest(self, analysis: AnalysisInsights, expanded_components: list) -> None:
-        """Save the analysis manifest for incremental updates."""
-        try:
-            repo_state_hash = get_repo_state_hash(self.repo_location)
-            base_commit = get_git_commit_hash(self.repo_location)
+    def rebuild_global_relations(
+        self,
+        root_analysis: AnalysisInsights,
+        sub_analyses: dict[str, AnalysisInsights],
+    ) -> list:
+        """Rebuild cross-boundary component relations at the deepest available granularity.
 
-            expanded_names = [c.component_id for c in expanded_components]
+        Walks the full CFG with a global node->deepest-component-id map so we
+        catch edges like ``1.1.1 -> 2.1.2`` that per-level analysis cannot see.
+        Mutates ``root_analysis.components_relations`` in place and returns the
+        new list. Returns ``[]`` if no static-analysis backend is available
+        (legacy / mocked code paths).
+        """
+        if not self.static_analysis:
+            return []
 
-            manifest = build_manifest_from_analysis(
-                analysis=analysis,
-                repo_state_hash=repo_state_hash,
-                base_commit=base_commit,
-                expanded_components=expanded_names,
+        cfg_graphs = {str(lang): self.static_analysis.get_cfg(lang) for lang in self.static_analysis.get_languages()}
+        global_relations = build_global_relations(root_analysis, sub_analyses, cfg_graphs)
+        root_analysis.components_relations = global_relations
+        return global_relations
+
+    def expand_component(
+        self,
+        component: Component,
+    ) -> tuple[AnalysisInsights, list[Component]] | None:
+        """Detail-analyze a single component and persist the updated unified analysis.
+
+        Shared path for CLI ``partial`` updates and IDE expand operations. The
+        caller is responsible for loading the existing analysis and locating
+        the target component.
+
+        Why: ``components_relations`` is no longer serialized per sub-analysis
+        (see ``analysis_json.collect_leaf_relations``). To keep the freshly
+        produced sub-analysis's LLM relation labels — which would otherwise be
+        dropped by the ``save_sub_analysis`` -> ``load_full_analysis`` round-trip
+        — we merge the in-memory ``sub_analysis`` (with its labels) into the
+        reloaded ``sub_analyses`` dict before calling ``rebuild_global_relations``.
+
+        Returns ``(sub_analysis, new_components)`` on success, ``None`` on failure.
+        """
+        if self.details_agent is None or self.abstraction_agent is None:
+            self.pre_analysis()
+
+        comp_id, sub_analysis, new_components = self.process_component(component)
+        if comp_id is None or sub_analysis is None:
+            logger.error("Failed to generate sub-analysis for component '%s'", component.component_id)
+            return None
+
+        output_dir = Path(self.output_dir)
+        save_sub_analysis(sub_analysis, output_dir, component.component_id)
+        logger.info("Saved sub-analysis for component '%s'", component.component_id)
+
+        updated = load_full_analysis(output_dir)
+        if not updated:
+            logger.warning(
+                "Could not reload analysis after saving sub-analysis for '%s'; " "global relations were not rebuilt",
+                comp_id,
+            )
+            return sub_analysis, new_components
+
+        updated_root, updated_subs = updated
+        # Override the round-tripped (label-less) sub-analysis with the in-memory
+        # one so ``rebuild_global_relations`` sees the just-produced LLM labels.
+        updated_subs[comp_id] = sub_analysis
+
+        global_relations = self.rebuild_global_relations(updated_root, updated_subs)
+        if global_relations:
+            save_analysis(
+                analysis=updated_root,
+                output_dir=output_dir,
+                sub_analyses=updated_subs,
+                repo_name=self.repo_name,
+            )
+            logger.info("Rebuilt %d global relations after expanding '%s'", len(global_relations), comp_id)
+
+        return sub_analysis, new_components
+
+    def _collect_method_entries_from_static_analysis(self) -> dict[str, list]:
+        assert self.static_analysis is not None
+        methods_by_file: dict[str, list[MethodEntry]] = defaultdict(list)
+
+        for language in self.static_analysis.get_languages():
+            try:
+                cfg = self.static_analysis.get_cfg(language)
+            except ValueError:
+                continue
+
+            for node in cfg.nodes.values():
+                if node.is_callback_or_anonymous():
+                    continue
+                if not (node.is_callable() or node.is_class()):
+                    continue
+                file_path = normalize_repo_path(node.file_path, self.repo_location)
+
+                methods_by_file[file_path].append(
+                    MethodEntry(
+                        qualified_name=node.fully_qualified_name,
+                        start_line=node.line_start,
+                        end_line=node.line_end,
+                        node_type=node.type.name,
+                    )
+                )
+
+        for file_path, methods in methods_by_file.items():
+            methods.sort(key=lambda method: (method.start_line, method.end_line, method.qualified_name))
+            methods_by_file[file_path] = methods
+
+        return methods_by_file
+
+    def _build_file_coverage_summary(self) -> FileCoverageSummary | None:
+        if not self.file_coverage_data:
+            return None
+        summary = self.file_coverage_data["summary"]
+        return FileCoverageSummary(
+            total_files=summary["total_files"],
+            analyzed=summary["analyzed"],
+            not_analyzed=summary["not_analyzed"],
+            not_analyzed_by_reason=summary["not_analyzed_by_reason"],
+        )
+
+    def generate_analysis_incremental(
+        self,
+        root_analysis: AnalysisInsights,
+        sub_analyses: dict[str, AnalysisInsights],
+    ) -> Path:
+        """Cluster-driven incremental update of an existing ``analysis.json``.
+
+        Deterministic cluster delta, one LLM call to route delta clusters,
+        then ``_generate_subcomponents`` seeded with the changed components.
+        Falls back to a full run when no baseline cluster info exists.
+        """
+        if self.details_agent is None or self.abstraction_agent is None:
+            self.pre_analysis()
+        assert self.static_analysis is not None
+        assert self.abstraction_agent is not None
+
+        monitor = self.stats_writer if self.stats_writer else nullcontext()
+        with monitor:
+            # Scrub before cluster math: orphan-routed files never appear in
+            # any cluster, so deletes wouldn't surface via the delta alone.
+            live_files: set[str] = set()
+            for language in self.static_analysis.get_languages():
+                try:
+                    cfg = self.static_analysis.get_cfg(language)
+                except (ValueError, KeyError):
+                    continue
+                for node in cfg.nodes.values():
+                    if node.file_path:
+                        live_files.add(normalize_repo_path(node.file_path, self.repo_location))
+            remove_deleted_files(root_analysis, sub_analyses, live_files)
+
+            old_snapshot = snapshot_from_static_analysis(self.static_analysis)
+            if not old_snapshot.all_cluster_ids():
+                # No cluster_cache on the live CFG — no prior pkl, legacy pkl,
+                # or first-ever incremental run. Refuse to silently rebuild
+                # from scratch; that would discard the existing analysis.json's
+                # depth and component IDs. Caller must explicitly request a
+                # full run instead.  ``IncrementalCacheMissingError`` inspects
+                # the artifact dir to pick the specific diagnostic (missing
+                # pkl, missing sha, or pkl-without-cluster-baseline).
+                artifact_dir = self.output_dir
+                error = IncrementalCacheMissingError(artifact_dir)
+                logger.error("%s", error)
+                raise error
+
+            delta = compute_cluster_delta(
+                old_snapshot,
+                self.static_analysis,
+                changes=self.changes,
+                repo_dir=self.repo_location,
+            )
+            if not delta.has_changes:
+                logger.info("Cluster delta is empty; rewriting current analysis without re-detailing.")
+                prune_empty_components(root_analysis, sub_analyses)
+                commit_hash = get_git_commit_hash(self.repo_location)
+                self._strip_ignored(root_analysis, sub_analyses)
+                analysis_path = save_analysis(
+                    analysis=root_analysis,
+                    output_dir=Path(self.output_dir),
+                    sub_analyses=sub_analyses,
+                    repo_name=self.repo_name,
+                    file_coverage_summary=self._build_file_coverage_summary(),
+                    commit_hash=commit_hash,
+                ).resolve()
+                self._write_file_coverage()
+                self._persist_static_analysis_artifact()
+                return analysis_path
+
+            agent_llm, parsing_llm = initialize_llms()
+            incremental_agent = IncrementalAgent(
+                repo_dir=self.repo_location,
+                static_analysis=self.static_analysis,
+                project_name=self.repo_name,
+                meta_context=self.meta_context,
+                agent_llm=agent_llm,
+                parsing_llm=parsing_llm,
+            )
+            self._monitoring_agents["IncrementalAgent"] = incremental_agent
+            delta_cluster_analysis = incremental_agent.run(delta, root_analysis, sub_analyses)
+
+            redetail_ids = stitch_delta(root_analysis, sub_analyses, delta_cluster_analysis, delta)
+
+            # Refresh first (per-component, siblings untouched), then prune —
+            # we only know a component is empty after rebuilding from live CFG.
+            touched_scopes = repopulate_touched_scopes(
+                redetail_ids,
+                root_analysis,
+                sub_analyses,
+                delta.cluster_results(),
+                self.abstraction_agent,
             )
 
-            save_manifest(manifest, self.output_dir)
-            logger.info(f"Saved manifest with {len(manifest.file_to_component)} file mappings")
-        except Exception as e:
-            logger.warning(f"Failed to save manifest: {e}")
+            removed_ids = prune_empty_components(root_analysis, sub_analyses)
+            if removed_ids:
+                redetail_ids -= removed_ids
 
-    def generate_analysis_smart(self) -> Path:
-        """Run full analysis."""
-        return self.generate_analysis()
+            redetail_components = _collect_components_by_id(redetail_ids, root_analysis, sub_analyses)
+            if redetail_components:
+                _, redetailed_subs = self._generate_subcomponents(root_analysis, redetail_components)
+                _merge_sub_analyses(sub_analyses, redetailed_subs)
+
+            if touched_scopes:
+                incremental_agent.generate_all_scope_relations(root_analysis, sub_analyses, touched_scopes)
+
+            # After per-scope LLM labels are regenerated, recompute the global
+            # cross-boundary relation set so deep edges between any two
+            # components (across scopes, across roots) are present at the
+            # deepest available granularity.
+            global_relations = self.rebuild_global_relations(root_analysis, sub_analyses)
+            if global_relations:
+                logger.info(
+                    "[incremental] replaced per-level relations with %d global cross-boundary relations",
+                    len(global_relations),
+                )
+
+            # Rebuild the global files index, unioning every sub-analysis's
+            # files into root. The incremental flow never reruns AbstractionAgent
+            # over the full CFG, so root.files lags behind deeper levels;
+            # build_unified_analysis_json reads only root.files for the top
+            # index, so we must surface every depth's files there.
+            for sub in sub_analyses.values():
+                sub.files = self.abstraction_agent.build_files_index(sub)
+            unified_files = self.abstraction_agent.build_files_index(root_analysis)
+            for sub in sub_analyses.values():
+                for fp, entry in sub.files.items():
+                    unified_files.setdefault(fp, entry)
+            root_analysis.files = unified_files
+
+            commit_hash = get_git_commit_hash(self.repo_location)
+            self._strip_ignored(root_analysis, sub_analyses)
+            n_subs = sum(len(sub.components) for sub in sub_analyses.values())
+            logger.info(
+                "[incremental] saving: %d root + %d sub-components, %d relations",
+                len(root_analysis.components),
+                n_subs,
+                len(root_analysis.components_relations),
+            )
+            analysis_path = save_analysis(
+                analysis=root_analysis,
+                output_dir=Path(self.output_dir),
+                sub_analyses=sub_analyses,
+                repo_name=self.repo_name,
+                file_coverage_summary=self._build_file_coverage_summary(),
+                commit_hash=commit_hash,
+            ).resolve()
+            # Seed the new cluster baseline only after analysis.json is on
+            # disk. Order matters: save_analysis first, cache seed second — so
+            # a crash between the two leaves the next incremental re-doing
+            # this delta (idempotent) rather than silently missing it.
+            self._seed_incremental_cluster_cache(delta.cluster_results())
+            self._write_file_coverage()
+            self._persist_static_analysis_artifact()
+            return analysis_path
+
+
+def _collect_components_by_id(
+    component_ids: set[str],
+    root_analysis: AnalysisInsights,
+    sub_analyses: dict[str, AnalysisInsights],
+) -> list[Component]:
+    """Return concrete ``Component`` objects matching the given IDs across root + sub-analyses."""
+    if not component_ids:
+        return []
+    found: list[Component] = []
+    seen: set[str] = set()
+    for analysis in [root_analysis, *sub_analyses.values()]:
+        for component in analysis.components:
+            if component.component_id in component_ids and component.component_id not in seen:
+                found.append(component)
+                seen.add(component.component_id)
+    return found
+
+
+def _merge_sub_analyses(
+    target: dict[str, AnalysisInsights],
+    updates: dict[str, AnalysisInsights],
+) -> None:
+    """Merge *updates* into *target*, preserving components the redetailer didn't touch.
+
+    ``_generate_subcomponents`` produces fresh sub-analyses that only contain
+    components the detailer LLM generated.  In the incremental path, ``stitch_delta``
+    may have inserted brand-new components (e.g. MCP Server Interface) that the
+    detailer never saw because they weren't in its input scope.  A plain
+    ``dict.update()`` would wipe those survivors out.
+
+    For each key in *updates*, we:
+      1. Keep old components whose IDs are absent from the new sub-analysis.
+      2. Replace everything else with the new sub-analysis data.
+      3. Union the relations (old relations referencing surviving components are kept).
+    """
+    for key, new_sub in updates.items():
+        old_sub = target.get(key)
+        if old_sub is None:
+            target[key] = new_sub
+            continue
+
+        new_ids = {c.component_id for c in new_sub.components}
+        surviving = [c for c in old_sub.components if c.component_id not in new_ids]
+        surviving_ids = {c.component_id for c in surviving}
+        if surviving:
+            new_sub.components = surviving + new_sub.components
+
+        kept_relations = [
+            r for r in old_sub.components_relations if (r.src_id in surviving_ids or r.dst_id in surviving_ids)
+        ]
+        if kept_relations:
+            new_sub.components_relations = kept_relations + new_sub.components_relations
+
+        target[key] = new_sub

@@ -4,6 +4,7 @@ Tests for Java utility functions.
 
 import platform
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
@@ -180,10 +181,6 @@ class TestDetectJavaInstallations(unittest.TestCase):
     @patch("static_analyzer.java_utils.get_java_version")
     def test_detect_validates_java_executable(self, mock_version):
         """Test that only JDKs with valid java executable are returned."""
-        # Create a real temporary directory structure for testing
-        import tempfile
-        import os
-
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create valid JDK structure
             valid_jdk = Path(tmpdir) / "java-21"
@@ -233,6 +230,7 @@ class TestDetectJavaInstallations(unittest.TestCase):
 class TestFindJava21OrLater(unittest.TestCase):
     """Test finding Java 21+ installation."""
 
+    @patch.dict("os.environ", {}, clear=True)
     @patch("static_analyzer.java_utils.detect_java_installations")
     @patch("static_analyzer.java_utils.get_java_version")
     def test_find_java_21_from_installations(self, mock_version, mock_detect):
@@ -247,6 +245,7 @@ class TestFindJava21OrLater(unittest.TestCase):
 
         self.assertEqual(java_home, Path("/usr/lib/jvm/java-21"))
 
+    @patch.dict("os.environ", {}, clear=True)
     @patch("static_analyzer.java_utils.detect_java_installations")
     @patch("static_analyzer.java_utils.get_java_version")
     def test_find_java_23_from_installations(self, mock_version, mock_detect):
@@ -258,6 +257,7 @@ class TestFindJava21OrLater(unittest.TestCase):
 
         self.assertEqual(java_home, Path("/usr/lib/jvm/java-23"))
 
+    @patch.dict("os.environ", {}, clear=True)
     @patch("static_analyzer.java_utils.detect_java_installations")
     @patch("static_analyzer.java_utils.get_java_version")
     def test_find_java_only_old_versions(self, mock_version, mock_detect):
@@ -272,6 +272,7 @@ class TestFindJava21OrLater(unittest.TestCase):
 
         self.assertIsNone(java_home)
 
+    @patch.dict("os.environ", {}, clear=True)
     @patch("static_analyzer.java_utils.detect_java_installations")
     @patch("static_analyzer.java_utils.get_java_version")
     @patch("shutil.which")
@@ -287,6 +288,7 @@ class TestFindJava21OrLater(unittest.TestCase):
         self.assertIsNotNone(java_home)
         self.assertEqual(java_home, Path("/usr/bin/java").resolve().parent.parent)
 
+    @patch.dict("os.environ", {}, clear=True)
     @patch("static_analyzer.java_utils.detect_java_installations")
     @patch("static_analyzer.java_utils.get_java_version")
     def test_find_java_none_available(self, mock_version, mock_detect):
@@ -298,44 +300,126 @@ class TestFindJava21OrLater(unittest.TestCase):
 
         self.assertIsNone(java_home)
 
+    def test_java_home_wins_over_newer_jdk_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_java_home = Path(tmpdir) / "jdk-21"
+            (fake_java_home / "bin").mkdir(parents=True)
+            (fake_java_home / "bin" / "java").touch()
+
+            with patch.dict("os.environ", {"JAVA_HOME": str(fake_java_home)}):
+                with patch("static_analyzer.java_utils.get_java_version", return_value=21) as mock_version:
+                    with patch("static_analyzer.java_utils.detect_java_installations") as mock_detect:
+                        result = find_java_21_or_later()
+
+                        self.assertEqual(result, fake_java_home)
+                        mock_detect.assert_not_called()
+                        mock_version.assert_called_once()
+
+    def test_java_home_too_old_falls_through_to_scan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_java_home = Path(tmpdir) / "jdk-17"
+            (old_java_home / "bin").mkdir(parents=True)
+            (old_java_home / "bin" / "java").touch()
+
+            scanned_jdk = Path("/opt/jvm/jdk-21")
+
+            with patch.dict("os.environ", {"JAVA_HOME": str(old_java_home)}):
+                with patch(
+                    "static_analyzer.java_utils.get_java_version",
+                    side_effect=[17, 21],  # JAVA_HOME probe, then scanned jdk
+                ):
+                    with patch(
+                        "static_analyzer.java_utils.detect_java_installations",
+                        return_value=[scanned_jdk],
+                    ):
+                        result = find_java_21_or_later()
+
+                        self.assertEqual(result, scanned_jdk)
+
+    def test_java_home_unset_uses_scan(self):
+        """No JAVA_HOME: existing scan-and-sort behavior is preserved."""
+        scanned_jdk = Path("/opt/jvm/jdk-21")
+
+        with patch.dict("os.environ", {}, clear=True):
+            with patch(
+                "static_analyzer.java_utils.detect_java_installations",
+                return_value=[scanned_jdk],
+            ):
+                with patch("static_analyzer.java_utils.get_java_version", return_value=21):
+                    result = find_java_21_or_later()
+
+                    self.assertEqual(result, scanned_jdk)
+
 
 class TestGetJdtlsConfigDir(unittest.TestCase):
     """Test JDTLS configuration directory selection."""
 
+    @patch("platform.machine")
     @patch("platform.system")
-    def test_get_config_dir_linux(self, mock_system):
+    def test_get_config_dir_linux(self, mock_system, mock_machine):
         """Test getting config directory on Linux."""
         mock_system.return_value = "Linux"
+        mock_machine.return_value = "x86_64"
         jdtls_root = Path("/opt/jdtls")
 
         config_dir = get_jdtls_config_dir(jdtls_root)
 
         self.assertEqual(config_dir, Path("/opt/jdtls/config_linux"))
 
+    @patch("platform.machine")
     @patch("platform.system")
-    def test_get_config_dir_macos(self, mock_system):
+    def test_get_config_dir_macos(self, mock_system, mock_machine):
         """Test getting config directory on macOS."""
         mock_system.return_value = "Darwin"
+        mock_machine.return_value = "x86_64"
         jdtls_root = Path("/opt/jdtls")
 
         config_dir = get_jdtls_config_dir(jdtls_root)
 
         self.assertEqual(config_dir, Path("/opt/jdtls/config_mac"))
 
+    @patch("platform.machine")
     @patch("platform.system")
-    def test_get_config_dir_windows(self, mock_system):
+    def test_get_config_dir_windows(self, mock_system, mock_machine):
         """Test getting config directory on Windows."""
         mock_system.return_value = "Windows"
+        mock_machine.return_value = "x86_64"
         jdtls_root = Path("C:/jdtls")
 
         config_dir = get_jdtls_config_dir(jdtls_root)
 
         self.assertEqual(config_dir, Path("C:/jdtls/config_win"))
 
+    @patch("platform.machine")
     @patch("platform.system")
-    def test_get_config_dir_unsupported(self, mock_system):
+    def test_get_config_dir_macos_arm64(self, mock_system, mock_machine):
+        """Test getting arm64 config directory on macOS."""
+        mock_system.return_value = "Darwin"
+        mock_machine.return_value = "arm64"
+        jdtls_root = Path("/opt/jdtls")
+
+        config_dir = get_jdtls_config_dir(jdtls_root)
+
+        self.assertEqual(config_dir, Path("/opt/jdtls/config_mac_arm"))
+
+    @patch("platform.machine")
+    @patch("platform.system")
+    def test_get_config_dir_linux_arm64(self, mock_system, mock_machine):
+        """Test getting arm64 config directory on Linux."""
+        mock_system.return_value = "Linux"
+        mock_machine.return_value = "aarch64"
+        jdtls_root = Path("/opt/jdtls")
+
+        config_dir = get_jdtls_config_dir(jdtls_root)
+
+        self.assertEqual(config_dir, Path("/opt/jdtls/config_linux_arm"))
+
+    @patch("platform.machine")
+    @patch("platform.system")
+    def test_get_config_dir_unsupported(self, mock_system, mock_machine):
         """Test error on unsupported platform."""
         mock_system.return_value = "FreeBSD"
+        mock_machine.return_value = "x86_64"
         jdtls_root = Path("/opt/jdtls")
 
         with self.assertRaises(RuntimeError) as context:

@@ -104,12 +104,31 @@ VSCODE_CONFIG = {
             "file_extensions": [".php"],
             "install_commands": "npm install intelephense",
         },
+        "csharp": {
+            "name": "csharp-ls Language Server",
+            "command": ["csharp-ls"],
+            "languages": ["csharp"],
+            "file_extensions": [".cs"],
+            # csharp-ls is installed via `dotnet tool install --tool-path` by
+            # tool_registry. Full migration mode targets .NET 10.
+            "install_commands": "codeboarding-setup (installs csharp-ls automatically; requires .NET SDK 10.0+)",
+        },
         "java": {
             "name": "Eclipse JDT Language Server",
             "command": ["java"],  # Placeholder - will be resolved by update_command_paths()
             "languages": ["java"],
             "file_extensions": [".java"],
             "install_commands": "null",
+        },
+        "rust": {
+            "name": "rust-analyzer",
+            "command": ["rust-analyzer"],
+            "languages": ["rust"],
+            "file_extensions": [".rs"],
+            # rust-analyzer is downloaded from rust-lang/rust-analyzer releases
+            # by tool_registry; the install_commands string is informational only
+            # and surfaces in error messages when the binary cannot be located.
+            "install_commands": "codeboarding-setup (downloads rust-analyzer automatically)",
         },
     },
     "tools": {

@@ -7,7 +7,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from repo_utils.ignore import RepoIgnoreManager
-from static_analyzer.constants import NodeType
+from static_analyzer.constants import LANGUAGE_EXTENSIONS, Language, NodeType
+from static_analyzer.engine.lsp_client import LSPClient
 from static_analyzer.engine.lsp_constants import (
     CALLABLE_KINDS,
     CLASS_LIKE_KINDS,
@@ -28,8 +29,21 @@ class LanguageAdapter(ABC):
 
     @property
     @abstractmethod
+    def language_enum(self) -> Language:
+        """The :class:`Language` enum member this adapter handles.
+
+        Drives :attr:`file_extensions` via ``LANGUAGE_EXTENSIONS`` so the
+        per-language extension set lives in exactly one place.
+        """
+
+    @property
     def file_extensions(self) -> tuple[str, ...]:
-        """File extensions for this language (e.g., ('.py',))."""
+        """File extensions for this language.
+
+        Derived from ``LANGUAGE_EXTENSIONS[self.language_enum]`` — override
+        only if a subclass needs a narrower set than the canonical one.
+        """
+        return LANGUAGE_EXTENSIONS[self.language_enum]
 
     @property
     @abstractmethod
@@ -134,9 +148,79 @@ class LanguageAdapter(ABC):
         """
         return None
 
+    def get_lsp_default_timeout(self) -> int:
+        """Return the default per-request timeout in seconds for the LSP client.
+
+        Override for language servers that need more time to index large
+        projects before they can respond to requests (e.g., csharp-ls
+        loading a Roslyn workspace).  The default (60s) is suitable for
+        most servers.
+        """
+        return 60
+
+    @property
+    def wait_for_workspace_ready(self) -> bool:
+        """If True, call wait_for_server_ready() after LSP startup.
+
+        Workspace-based servers (e.g., JDTLS, csharp-ls) need to finish
+        loading projects before they can respond to requests.  When True,
+        the analyzer blocks on wait_for_server_ready() after start().
+        """
+        return False
+
+    @property
+    def probe_before_open(self) -> bool:
+        """If True, send the sync probe BEFORE bulk didOpen notifications.
+
+        Workspace-based servers (e.g., csharp-ls) load all files from the
+        solution/project automatically.  Sending hundreds of didOpen
+        notifications before the workspace is ready can overwhelm them.
+        When True, the call graph builder sends the sync probe first to
+        wait for workspace loading, then opens files individually as
+        needed for analysis.
+        """
+        return False
+
+    def get_probe_timeout_minimum(self) -> int:
+        """Return the minimum probe timeout in seconds for initial indexing.
+
+        The call graph builder sends a sync probe after opening all files
+        to wait for the LSP server to finish indexing.  Some servers
+        (e.g., csharp-ls loading a Roslyn workspace) need significantly
+        more time than the default 300s base.  Override to raise the floor.
+        """
+        return 0
+
+    def wait_for_diagnostics(self, client: LSPClient) -> None:
+        """Block until the LSP server is done publishing diagnostics for didOpen'd files.
+
+        Default no-op: most LSPs (pyright, gopls, intelephense, JDTLS,
+        TypeScript) publish diagnostics synchronously during didOpen
+        handling, so by the time Phase 1/2 finishes everything is in the
+        queue. Adapters whose servers publish *asynchronously* override
+        this to either:
+          (a) re-use ``wait_for_server_ready`` after ``reset_ready_signal``
+              when the LSP has a real readiness signal that flips around
+              didOpen processing (rust-analyzer's ``quiescent``); or
+          (b) call ``client.wait_for_diagnostics_quiesce`` to debounce on
+              publishDiagnostics activity when there is no signal at all
+              (csharp-ls).
+        """
+        return None
+
     def get_lsp_env(self) -> dict[str, str]:
         """Return extra environment variables for the LSP server process."""
         return {}
+
+    def prepare_project(self, project_root: Path) -> None:
+        """Run any pre-LSP project preparation (e.g. dependency restore).
+
+        Default no-op. C# overrides to run ``dotnet restore`` so csharp-ls
+        sees a populated ``obj/project.assets.json`` and can resolve
+        framework references; otherwise it floods diagnostics with
+        ``CS0518: Predefined type System.X is not defined``.
+        """
+        return None
 
     def discover_source_files(self, project_root: Path, ignore_manager: RepoIgnoreManager) -> list[Path]:
         """Discover source files for this adapter under a project root.
@@ -205,6 +289,14 @@ class LanguageAdapter(ABC):
         languages where references queries are too slow (e.g. Java/JDTLS).
         """
         return EdgeStrategy.REFERENCES
+
+    @property
+    def extra_client_capabilities(self) -> dict:
+        """Vendor-specific keys to shallow-merge into the LSP ``initialize``
+        capabilities (e.g. ``{"experimental": {...}}``). Default ``{}`` keeps
+        the shared client free of language-specific opt-ins.
+        """
+        return {}
 
     @property
     def references_batch_size(self) -> int:

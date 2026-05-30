@@ -11,7 +11,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
-from agents.constants import LLMDefaults
+from agents.constants import LLMDefaults, ModelCapabilities
+from agents.model_capabilities import ContextWindow, get_context_window
 from agents.prompts.prompt_factory import LLMType, initialize_global_factory
 from monitoring.callbacks import MonitoringCallback
 
@@ -123,7 +124,7 @@ LLM_PROVIDERS = {
         chat_class=ChatOpenAI,
         api_key_env="VERCEL_API_KEY",
         agent_model="google/gemini-3-flash",
-        parsing_model="openai/gpt-5-mini",  # Use OpenAI model for parsing to avoid trustcall compatibility issues with Gemini
+        parsing_model="openai/gpt-5-mini",
         llm_type=LLMType.GEMINI_FLASH,
         alt_env_vars=["VERCEL_BASE_URL"],
         extra_args={
@@ -136,8 +137,8 @@ LLM_PROVIDERS = {
     "anthropic": LLMConfig(
         chat_class=ChatAnthropic,
         api_key_env="ANTHROPIC_API_KEY",
-        agent_model="claude-3-7-sonnet-20250219",
-        parsing_model="claude-3-haiku-20240307",
+        agent_model="claude-sonnet-4-6",
+        parsing_model="claude-haiku-4-5",
         llm_type=LLMType.CLAUDE,
         extra_args={
             "max_tokens": 8192,
@@ -148,8 +149,8 @@ LLM_PROVIDERS = {
     "google": LLMConfig(
         chat_class=ChatGoogleGenerativeAI,
         api_key_env="GOOGLE_API_KEY",
-        agent_model="gemini-3-flash",
-        parsing_model="gemini-3-flash",
+        agent_model="gemini-3-flash-preview",
+        parsing_model="gemini-3.1-flash-lite",
         llm_type=LLMType.GEMINI_FLASH,
         extra_args={
             "max_tokens": None,
@@ -160,9 +161,9 @@ LLM_PROVIDERS = {
     "aws": LLMConfig(
         chat_class=ChatBedrockConverse,
         api_key_env="AWS_BEARER_TOKEN_BEDROCK",  # Used for existence check
-        agent_model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-        parsing_model="us.anthropic.claude-3-haiku-20240307-v1:0",
-        llm_type=LLMType.CLAUDE,
+        agent_model="anthropic.claude-sonnet-4-6",
+        parsing_model="claude-haiku-4-5",
+        llm_type=LLMType.CLAUDE_SONNET,
         extra_args={
             "max_tokens": 4096,
             "region_name": lambda: os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
@@ -172,9 +173,9 @@ LLM_PROVIDERS = {
     "cerebras": LLMConfig(
         chat_class=ChatCerebras,
         api_key_env="CEREBRAS_API_KEY",
-        agent_model="gpt-oss-120b",
-        parsing_model="llama3.1-8b",
-        llm_type=LLMType.GPT4,
+        agent_model="zai-glm-4.7",
+        parsing_model="gpt-oss-120b",
+        llm_type=LLMType.KIMI,
         extra_args={
             "max_tokens": None,
             "timeout": None,
@@ -210,8 +211,8 @@ LLM_PROVIDERS = {
     "glm": LLMConfig(
         chat_class=ChatOpenAI,
         api_key_env="GLM_API_KEY",
-        agent_model="glm-4-flash",
-        parsing_model="glm-4-flash",
+        agent_model="glm-4.7-flash",
+        parsing_model="glm-4.7-flash",
         llm_type=LLMType.GLM,
         alt_env_vars=["GLM_BASE_URL"],
         extra_args={
@@ -238,8 +239,8 @@ LLM_PROVIDERS = {
     "openrouter": LLMConfig(
         chat_class=ChatOpenAI,
         api_key_env="OPENROUTER_API_KEY",
-        agent_model="google/gemini-2.5-flash",
-        parsing_model="google/gemini-2.5-flash",
+        agent_model="google/gemini-3-flash-preview",
+        parsing_model="google/gemini-3-flash-preview",
         llm_type=LLMType.GEMINI_FLASH,
         extra_args={
             "base_url": lambda: os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
@@ -258,57 +259,87 @@ def _initialize_llm(
     log_prefix: str,
     init_factory: bool = False,
 ) -> tuple[BaseChatModel, str]:
+    resolved = _resolve_active_provider(model_override, model_attr)
+    if resolved is None:
+        required_vars = []
+        for config in LLM_PROVIDERS.values():
+            required_vars.append(config.api_key_env)
+            required_vars.extend(config.alt_env_vars)
+
+        raise ValueError(
+            f"No valid LLM configuration found. Please set one of: {', '.join(sorted(set(required_vars)))}"
+        )
+
+    name, config, model_name = resolved
+
+    if init_factory:
+        detected_llm_type = LLMType.from_model_name(model_name)
+        initialize_global_factory(detected_llm_type)
+        logger.info(
+            f"Initialized prompt factory for {name} provider with model '{model_name}' "
+            f"-> {detected_llm_type.value} prompt factory"
+        )
+
+    logger.info(f"Using {name.title()} {log_prefix}LLM with model: {model_name}")
+
+    kwargs = {
+        "model": model_name,
+        "temperature": getattr(config, temperature_attr),
+    }
+    kwargs.update(config.get_resolved_extra_args())
+
+    if name not in ["aws", "ollama"]:
+        api_key = config.get_api_key()
+        kwargs["api_key"] = api_key or "no-key-required"
+
+    model = config.chat_class(**kwargs)  # type: ignore[call-arg, arg-type]
+    return model, model_name
+
+
+def _resolve_active_provider(
+    model_override: str | None,
+    model_attr: str,
+) -> tuple[str, LLMConfig, str] | None:
+    """Return the active provider, config, and resolved model name."""
     for name, config in LLM_PROVIDERS.items():
         if not config.is_active():
             continue
+        return name, config, model_override or getattr(config, model_attr)
+    return None
 
-        model_name = model_override or getattr(config, model_attr)
 
-        if init_factory:
-            detected_llm_type = LLMType.from_model_name(model_name)
-            initialize_global_factory(detected_llm_type)
-            logger.info(
-                f"Initialized prompt factory for {name} provider with model '{model_name}' "
-                f"-> {detected_llm_type.value} prompt factory"
-            )
-
-        logger.info(f"Using {name.title()} {log_prefix}LLM with model: {model_name}")
-
-        kwargs = {
-            "model": model_name,
-            "temperature": getattr(config, temperature_attr),
-        }
-        kwargs.update(config.get_resolved_extra_args())
-
-        if name not in ["aws", "ollama"]:
-            api_key = config.get_api_key()
-            kwargs["api_key"] = api_key or "no-key-required"
-
-        model = config.chat_class(**kwargs)  # type: ignore[call-arg, arg-type]
-        return model, model_name
-
-    required_vars = []
-    for config in LLM_PROVIDERS.values():
-        required_vars.append(config.api_key_env)
-        required_vars.extend(config.alt_env_vars)
-
-    raise ValueError(f"No valid LLM configuration found. Please set one of: {', '.join(sorted(set(required_vars)))}")
+class LLMConfigError(ValueError):
+    """Raised when LLM provider keys are missing or ambiguous."""
 
 
 def validate_api_key_provided() -> None:
-    """Raise ValueError if zero or more than one LLM provider key is configured."""
+    """Raise LLMConfigError if zero or more than one LLM provider key is configured."""
     active = [name for name, config in LLM_PROVIDERS.items() if config.is_active()]
     if not active:
         required = sorted({config.api_key_env for config in LLM_PROVIDERS.values()})
-        raise ValueError(f"No LLM provider API key found. Set one of: {', '.join(required)}")
+        raise LLMConfigError(f"No LLM provider API key found. Set one of: {', '.join(required)}")
     if len(active) > 1:
-        raise ValueError(f"Multiple LLM provider keys detected ({', '.join(active)}); please set only one.")
+        raise LLMConfigError(f"Multiple LLM provider keys detected ({', '.join(active)}); please set only one.")
 
 
 def initialize_agent_llm(model_override: str | None = None) -> BaseChatModel:
     model, model_name = _initialize_llm(model_override, "agent_model", "agent_temperature", "", init_factory=True)
     MONITORING_CALLBACK.model_name = model_name
     return model
+
+
+def get_current_agent_context_window() -> ContextWindow:
+    """Context window for the currently active agent provider/model.
+
+    Resolves the first active provider (same rule as ``_initialize_llm``) on
+    every call. ``get_context_window`` handles its own caching, so this is
+    cheap enough to call without a module-level cache.
+    """
+    resolved = _resolve_active_provider(_agent_model_override or os.getenv("AGENT_MODEL"), "agent_model")
+    if resolved is not None:
+        name, _config, model_name = resolved
+        return get_context_window(name, model_name)
+    return ContextWindow(ModelCapabilities.FALLBACK_INPUT, ModelCapabilities.FALLBACK_OUTPUT)
 
 
 def initialize_parsing_llm(model_override: str | None = None) -> BaseChatModel:
@@ -320,3 +351,12 @@ def initialize_llms() -> tuple[BaseChatModel, BaseChatModel]:
     agent_llm = initialize_agent_llm(_agent_model_override or os.getenv("AGENT_MODEL"))
     parsing_llm = initialize_parsing_llm(_parsing_model_override or os.getenv("PARSING_MODEL"))
     return agent_llm, parsing_llm
+
+
+def supports_prompt_caching(llm: BaseChatModel) -> bool:
+    """Return True when *llm* supports ephemeral prompt caching.
+
+    Only Anthropic's langchain integration exposes ``cache_control`` blocks
+    today; other providers either cache transparently or not at all.
+    """
+    return llm.__class__.__module__.startswith("langchain_anthropic")

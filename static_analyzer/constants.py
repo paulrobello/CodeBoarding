@@ -21,7 +21,38 @@ class Language(StrEnum):
     GO = "go"
     JAVA = "java"
     PHP = "php"
+    RUST = "rust"
+    CSHARP = "csharp"
     CPP = "cpp"
+
+
+# File extensions per language. Every ``Language`` member appears here — keep
+# it that way so adding a new language forces you to list its extensions in
+# the same edit. ``mypy`` enforces total coverage via the assertion below.
+LANGUAGE_EXTENSIONS: dict[Language, tuple[str, ...]] = {
+    Language.PYTHON: (".py",),
+    Language.TYPESCRIPT: (".ts", ".tsx", ".mts", ".cts"),
+    Language.JAVASCRIPT: (".js", ".jsx", ".mjs", ".cjs"),
+    Language.GO: (".go",),
+    Language.JAVA: (".java",),
+    Language.PHP: (".php",),
+    Language.RUST: (".rs",),
+    Language.CSHARP: (".cs",),
+    Language.CPP: (".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h"),
+}
+
+# Import-time invariant: every language has an extension list. Cheap check that
+# catches drift when the enum grows without a matching ``LANGUAGE_EXTENSIONS`` entry.
+assert set(LANGUAGE_EXTENSIONS) == set(
+    Language
+), f"LANGUAGE_EXTENSIONS missing: {set(Language) - set(LANGUAGE_EXTENSIONS)}"
+
+# Flattened reverse lookup: extension -> language. Used by the diff boundary
+# (``repo_utils/diff_parser.py``) to filter non-source changes. Derived from
+# ``LANGUAGE_EXTENSIONS`` so adding a language in one place updates both.
+SOURCE_EXTENSION_TO_LANGUAGE: dict[str, Language] = {
+    ext: language for language, exts in LANGUAGE_EXTENSIONS.items() for ext in exts
+}
 
 
 class ClusteringConfig:
@@ -41,16 +72,12 @@ class ClusteringConfig:
     # Display limits
     MAX_DISPLAY_CLUSTERS = 55  # Maximum clusters to show in output (readability limit)
 
-    # Language-specific delimiters for qualified names
-    DEFAULT_DELIMITER = "."  # Works for Python, Java, C#
-    DELIMITER_MAP = {
-        Language.PYTHON: ".",
-        Language.GO: ".",
-        Language.PHP: "\\",  # PHP uses backslash for namespaces
-        Language.TYPESCRIPT: ".",
-        Language.JAVASCRIPT: ".",
-        Language.JAVA: ".",
-    }
+    # Separator used by every ``LanguageAdapter.build_qualified_name``.
+    # A future per-language switch (e.g. Rust to ``::``) would need both a
+    # per-adapter override and updates to consumers that hardcode
+    # ``.split(".")`` (``language_adapter.extract_package``,
+    # ``cluster_methods_mixin.py``, ``diagnose_relations.py``).
+    QUALIFIED_NAME_DELIMITER = "."
 
     # Deterministic seed for clustering algorithms
     CLUSTERING_SEED = 42

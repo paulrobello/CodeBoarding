@@ -84,8 +84,18 @@ class DetailsAgent(ClusterMethodsMixin, CodeBoardingAgent):
 
         programming_langs = self.static_analysis.get_languages()
 
-        # Build cluster string using the pre-computed cluster results (same as AbstractionAgent)
-        cluster_str = self._build_cluster_string(programming_langs, subgraph_cluster_results)
+        overhead_chars = len(str(self.system_message.content)) + len(
+            self.prompts["group_clusters"].format(
+                project_name=self.project_name,
+                cfg_clusters="",
+                component=component.llm_str(),
+                meta_context=meta_context_str,
+                project_type=project_type,
+            )
+        )
+        cluster_str = self._build_cluster_string(
+            programming_langs, subgraph_cluster_results, prompt_overhead_chars=overhead_chars
+        )
 
         prompt = self.prompts["group_clusters"].format(
             project_name=self.project_name,
@@ -138,6 +148,8 @@ class DetailsAgent(ClusterMethodsMixin, CodeBoardingAgent):
 
         cluster_str = cluster_analysis.llm_str() if cluster_analysis else "No cluster analysis available."
 
+        group_names = [cc.name for cc in cluster_analysis.cluster_components] if cluster_analysis else []
+
         prompt = self.prompts["final_analysis"].format(
             project_name=self.project_name,
             cluster_analysis=cluster_str,
@@ -145,6 +157,12 @@ class DetailsAgent(ClusterMethodsMixin, CodeBoardingAgent):
             meta_context=meta_context_str,
             project_type=project_type,
         )
+
+        if group_names:
+            prompt += (
+                f"\n\n## All Group Names ({len(group_names)} total)\n"
+                f"Every one of these names: {group_names} must appear in exactly one component's source_group_names\n"
+            )
 
         # Build validation context with subgraph CFG graphs for edge checking
         context = ValidationContext(

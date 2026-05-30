@@ -22,8 +22,10 @@ class _TestAdapter(LanguageAdapter):
         return "Python"
 
     @property
-    def file_extensions(self) -> tuple[str, ...]:
-        return (".py",)
+    def language_enum(self):
+        from static_analyzer.constants import Language
+
+        return Language.PYTHON
 
     @property
     def lsp_command(self) -> list[str]:
@@ -51,6 +53,8 @@ def _make_adapter() -> MagicMock:
     adapter.get_all_packages.return_value = {"pkg"}
     adapter.get_package_for_file.return_value = "pkg"
     adapter.build_edges.return_value = set()
+    adapter.get_probe_timeout_minimum.return_value = 0
+    adapter.probe_before_open = False
     return adapter
 
 
@@ -139,8 +143,7 @@ class TestDiscoverSymbols:
         # Should sleep between batches
         mock_sleep.assert_called()
 
-    def test_probe_timeout_default_for_small_repos(self):
-        """Repos with <= 1000 files use the default 300s probe timeout."""
+    def test_probe_timeout_scales_linearly_with_file_count(self):
         lsp = _make_lsp()
         adapter = _make_adapter()
         builder = CallGraphBuilder(lsp, adapter, Path("/project"))
@@ -150,28 +153,11 @@ class TestDiscoverSymbols:
 
         builder._discover_symbols(files)
 
-        # The probe call is the first document_symbol call (with explicit timeout)
+        # 60s startup base + 2.0s per file
         probe_call = lsp.document_symbol.call_args_list[0]
-        assert probe_call.kwargs.get("timeout") == 300
-
-    def test_probe_timeout_scales_for_large_repos(self):
-        """Repos with > 1000 files get a scaled probe timeout."""
-        lsp = _make_lsp()
-        adapter = _make_adapter()
-        builder = CallGraphBuilder(lsp, adapter, Path("/project"))
-
-        files = [Path(f"/project/file_{i}.py") for i in range(2000)]
-        lsp.document_symbol.return_value = []
-
-        builder._discover_symbols(files)
-
-        probe_call = lsp.document_symbol.call_args_list[0]
-        timeout = probe_call.kwargs.get("timeout")
-        # 300 + (2000 - 1000) * 0.15 = 450
-        assert timeout == 450
+        assert probe_call.kwargs.get("timeout") == 260
 
     def test_probe_timeout_capped_at_maximum(self):
-        """Probe timeout is capped at 1800s even for very large repos."""
         lsp = _make_lsp()
         adapter = _make_adapter()
         builder = CallGraphBuilder(lsp, adapter, Path("/project"))
@@ -182,8 +168,7 @@ class TestDiscoverSymbols:
         builder._discover_symbols(files)
 
         probe_call = lsp.document_symbol.call_args_list[0]
-        timeout = probe_call.kwargs.get("timeout")
-        assert timeout == 1800
+        assert probe_call.kwargs.get("timeout") == 1800
 
 
 class TestBuild:

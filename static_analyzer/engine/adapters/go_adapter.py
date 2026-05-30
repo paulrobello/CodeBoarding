@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from pathlib import Path
 
 from repo_utils.ignore import RepoIgnoreManager, _ALWAYS_IGNORED_DIRS
+from static_analyzer.constants import Language
 from static_analyzer.engine.language_adapter import LanguageAdapter
 
 logger = logging.getLogger(__name__)
@@ -75,8 +77,8 @@ class GoAdapter(LanguageAdapter):
         return "Go"
 
     @property
-    def file_extensions(self) -> tuple[str, ...]:
-        return (".go",)
+    def language_enum(self) -> Language:
+        return Language.GO
 
     @property
     def lsp_command(self) -> list[str]:
@@ -85,6 +87,20 @@ class GoAdapter(LanguageAdapter):
     @property
     def language_id(self) -> str:
         return "go"
+
+    def get_lsp_command(self, project_root: Path) -> list[str]:
+        """Fail fast if the Go toolchain is missing.
+
+        gopls needs ``go`` on PATH to resolve modules and stdlib — without
+        it, indexing silently returns empty results. Mirrors Rust's check.
+        """
+        if shutil.which("go") is None:
+            raise RuntimeError(
+                "Go toolchain not found on PATH. gopls requires Go to "
+                "resolve modules and the standard library. Install one via "
+                "https://go.dev/dl/ and re-run the analysis."
+            )
+        return super().get_lsp_command(project_root)
 
     def build_qualified_name(
         self,

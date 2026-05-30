@@ -16,6 +16,8 @@ Install the extension from Open VSX.
 [![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Go](https://img.shields.io/badge/Go-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
 [![PHP](https://img.shields.io/badge/PHP-777BB4?style=flat-square&logo=php&logoColor=white)](https://www.php.net/)
+[![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![C#](https://custom-icon-badges.demolab.com/badge/C%23-512BD4.svg?style=flat-square&logo=cshrp&logoColor=white)](https://learn.microsoft.com/en-us/dotnet/csharp/)
 
 ## Few use cases:
 
@@ -68,7 +70,7 @@ For a deeper architecture walkthrough, see [`.codeboarding/overview.md`](.codebo
 uv sync --frozen
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 python install.py
-python main.py --local /path/to/repo
+python main.py full --local /path/to/repo
 ```
 
 ### Use the packaged CLI
@@ -78,7 +80,7 @@ Requires **Python 3.12 or 3.13**. The recommended install method is [pipx](https
 ```bash
 pipx install codeboarding --python python3.12
 codeboarding-setup
-codeboarding --local /path/to/repo
+codeboarding full --local /path/to/repo
 ```
 
 Or, if you prefer pip, install into a virtual environment (not the global Python):
@@ -86,12 +88,12 @@ Or, if you prefer pip, install into a virtual environment (not the global Python
 ```bash
 pip install codeboarding
 codeboarding-setup
-codeboarding --local /path/to/repo
+codeboarding full --local /path/to/repo
 ```
 
 Output is written to `/path/to/repo/.codeboarding/`.
 
-`python install.py` and `codeboarding-setup` download language server binaries to `~/.codeboarding/servers/`, shared across projects. `npm` is required for Python, TypeScript, JavaScript, and PHP language servers; if it is missing, setup can install it via `nodeenv`.
+`python install.py` and `codeboarding-setup` download language server binaries to `~/.codeboarding/servers/`, shared across projects. Node.js (and its bundled `npm`) is required for the Python, TypeScript, JavaScript, and PHP language servers; if neither `node` nor `CODEBOARDING_NODE_PATH` is set, setup downloads a pinned Node.js runtime into `~/.codeboarding/servers/nodeenv/` automatically.
 
 ## Configuration
 
@@ -118,19 +120,19 @@ Shell environment variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOG
 
 ```bash
 # Analyze a local repository
-python main.py --local ./my-project
+python main.py full --local ./my-project
 
 # Increase diagram depth
-python main.py --local ./my-project --depth-level 2
+python main.py full --local ./my-project --depth-level 2
 
 # Re-analyze only changed parts when possible
-python main.py --local ./my-project --incremental
+python main.py incremental --local ./my-project
 
 # Update a single component by ID
-python main.py --local ./my-project --partial-component-id "1.2"
+python main.py partial --local ./my-project --component-id "1.2"
 
 # Analyze a remote GitHub repository
-python main.py https://github.com/pytorch/pytorch
+python main.py full https://github.com/pytorch/pytorch
 ```
 
 ## Where to use it
@@ -141,7 +143,7 @@ python main.py https://github.com/pytorch/pytorch
 
 ## Supported stack
 
-- Languages: Python, TypeScript, JavaScript, Java, Go, PHP.
+- Languages: Python, TypeScript, JavaScript, Java, Go, PHP, Rust, C#.
 - LLM providers: OpenAI, Anthropic, Google, Vercel AI Gateway, AWS Bedrock, Ollama, OpenRouter, and more.
 
 ## Examples

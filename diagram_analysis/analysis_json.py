@@ -13,100 +13,8 @@ from agents.agent_responses import (
     MethodEntry,
     SourceCodeReference,
 )
-from agents.change_status import ChangeStatus
 
 logger = logging.getLogger(__name__)
-
-
-def _build_files_index_from_analysis(analysis: AnalysisInsights) -> dict[str, FileEntry]:
-    """Build a top-level files index from analysis."""
-    return {file_path: entry.model_copy(deep=True) for file_path, entry in analysis.files.items()}
-
-
-def _method_key(file_path: str, qualified_name: str) -> str:
-    return f"{file_path}|{qualified_name}"
-
-
-def _to_method_qualified_name(method: MethodEntry) -> str:
-    return method.qualified_name
-
-
-def _to_component_file_method_refs(file_methods: list[FileMethodGroup]) -> list["ComponentFileMethodGroupJson"]:
-    refs: list[ComponentFileMethodGroupJson] = []
-    for group in file_methods:
-        qnames: list[str] = []
-        seen: set[str] = set()
-        for method in group.methods:
-            qname = _to_method_qualified_name(method)
-            if qname in seen:
-                continue
-            seen.add(qname)
-            qnames.append(qname)
-        refs.append(
-            ComponentFileMethodGroupJson(file_path=group.file_path, file_status=group.file_status, methods=qnames)
-        )
-    return refs
-
-
-def _method_refs_to_placeholders(method_names: list[str]) -> list[MethodEntry]:
-    return [
-        MethodEntry(
-            qualified_name=method_name,
-            start_line=0,
-            end_line=0,
-            node_type="METHOD",
-        )
-        for method_name in method_names
-    ]
-
-
-def _build_methods_index_from_files(files_index: dict[str, FileEntry]) -> dict[str, "MethodIndexEntry"]:
-    methods_index: dict[str, MethodIndexEntry] = {}
-    for file_path, entry in files_index.items():
-        for method in entry.methods:
-            methods_index[_method_key(file_path, method.qualified_name)] = MethodIndexEntry(
-                file_path=file_path,
-                qualified_name=method.qualified_name,
-                start_line=method.start_line,
-                end_line=method.end_line,
-                type=method.node_type,
-                status=method.status,
-            )
-    return methods_index
-
-
-def _hydrate_component_methods_from_refs(
-    analysis: AnalysisInsights,
-    files_index: dict[str, FileEntry],
-    methods_index: dict[str, "MethodIndexEntry"],
-) -> None:
-    for component in analysis.components:
-        rebuilt: list[FileMethodGroup] = []
-        for group in component.file_methods:
-            file_path = group.file_path
-            file_entry = files_index.get(file_path)
-            file_status = file_entry.file_status if file_entry is not None else group.file_status
-            methods: list[MethodEntry] = []
-            for method in group.methods:
-                qname = _to_method_qualified_name(method)
-                indexed = methods_index.get(_method_key(file_path, qname))
-                if indexed is None:
-                    logger.warning(f"Missing method index entry for {file_path}|{qname}")
-                    continue
-                methods.append(
-                    MethodEntry(
-                        qualified_name=indexed.qualified_name,
-                        start_line=indexed.start_line,
-                        end_line=indexed.end_line,
-                        node_type=indexed.type,
-                        status=ChangeStatus(indexed.status),
-                    )
-                )
-
-            methods = sorted(methods, key=lambda m: (m.start_line, m.end_line, m.qualified_name))
-            rebuilt.append(FileMethodGroup(file_path=file_path, file_status=file_status, methods=methods))
-
-        component.file_methods = rebuilt
 
 
 class RelationJson(Relation):
@@ -139,8 +47,10 @@ class ComponentJson(Component):
     components: list["ComponentJson"] | None = Field(
         description="Sub-components if expanded, None otherwise.", default=None
     )
-    # components_relations removed: all relations are now stored globally at the root level
-    # as leaf-only relations. The frontend derives visible edges dynamically.
+    # All cross-component relations are serialized once at the root as a global
+    # leaf-only set (see ``collect_leaf_relations``). Renderers project that set
+    # down to each level via ``project_relations_to_level``; sub-components no
+    # longer carry their own ``components_relations`` field.
 
 
 class NotAnalyzedFile(BaseModel):
@@ -184,27 +94,38 @@ class MethodIndexEntry(BaseModel):
     start_line: int = Field(description="Starting line number in the file.")
     end_line: int = Field(description="Ending line number in the file.")
     type: str = Field(description="Node type name (METHOD, FUNCTION, CLASS, ...).")
-    status: str = Field(description="Diff status: added, modified, deleted, unchanged.")
 
 
 class ComponentFileMethodGroupJson(BaseModel):
     file_path: str = Field(description="Relative path to the source file.")
-    file_status: str = Field(
-        default="unchanged",
-        description="Diff status of this file: added, modified, deleted, renamed, or unchanged.",
-    )
     methods: list[str] = Field(
         default_factory=list,
         description="Qualified method/function names assigned to this component in this file.",
     )
 
 
+class FileEntryJson(BaseModel):
+    """Persisted file entry — stores only method-index keys.
+
+    Full method metadata lives in ``methods_index``; this avoids duplication.
+    """
+
+    method_keys: list[str] = Field(
+        default_factory=list,
+        description="Keys into ``methods_index`` ('<file_path>|<qualified_name>'), in declaration order.",
+    )
+
+
 class UnifiedAnalysisJson(BaseModel):
+    snapshotCommit: str | None = Field(
+        default=None,
+        description="Wrapper-owned snapshot ref used as the next incremental diff baseline.",
+    )
     metadata: AnalysisMetadata = Field(description="Metadata about the analysis run.")
     description: str = Field(
         description="One paragraph explaining the functionality which is represented by this graph."
     )
-    files: dict[str, FileEntry] = Field(
+    files: dict[str, FileEntryJson] = Field(
         default_factory=dict,
         description="Top-level file index keyed by relative file path.",
     )
@@ -214,6 +135,103 @@ class UnifiedAnalysisJson(BaseModel):
     )
     components: list[ComponentJson] = Field(description="List of the components identified in the project.")
     components_relations: list[RelationJson] = Field(description="List of relations among the components.")
+
+
+def _build_files_index_from_analysis(analysis: AnalysisInsights) -> dict[str, FileEntry]:
+    """Build a top-level files index from analysis."""
+    return {file_path: entry.model_copy(deep=True) for file_path, entry in analysis.files.items()}
+
+
+def _method_key(file_path: str, qualified_name: str) -> str:
+    return f"{file_path}|{qualified_name}"
+
+
+def _to_method_qualified_name(method: MethodEntry) -> str:
+    return method.qualified_name
+
+
+def _to_component_file_method_refs(file_methods: list[FileMethodGroup]) -> list[ComponentFileMethodGroupJson]:
+    refs: list[ComponentFileMethodGroupJson] = []
+    for group in file_methods:
+        qnames: list[str] = []
+        seen: set[str] = set()
+        for method in group.methods:
+            qname = _to_method_qualified_name(method)
+            if qname in seen:
+                continue
+            seen.add(qname)
+            qnames.append(qname)
+        refs.append(ComponentFileMethodGroupJson(file_path=group.file_path, methods=qnames))
+    return refs
+
+
+def _method_refs_to_placeholders(method_names: list[str]) -> list[MethodEntry]:
+    return [
+        MethodEntry(
+            qualified_name=method_name,
+            start_line=0,
+            end_line=0,
+            node_type="METHOD",
+        )
+        for method_name in method_names
+    ]
+
+
+def _build_methods_index_from_files(files_index: dict[str, FileEntry]) -> dict[str, MethodIndexEntry]:
+    methods_index: dict[str, MethodIndexEntry] = {}
+    for file_path, entry in files_index.items():
+        for method in entry.methods:
+            methods_index[_method_key(file_path, method.qualified_name)] = MethodIndexEntry(
+                file_path=file_path,
+                qualified_name=method.qualified_name,
+                start_line=method.start_line,
+                end_line=method.end_line,
+                type=method.node_type,
+            )
+    return methods_index
+
+
+def _build_file_entry_json_from_files(files_index: dict[str, FileEntry]) -> dict[str, FileEntryJson]:
+    return {
+        file_path: FileEntryJson(
+            method_keys=[_method_key(file_path, m.qualified_name) for m in entry.methods],
+        )
+        for file_path, entry in files_index.items()
+    }
+
+
+def _hydrate_component_methods_from_refs(
+    analysis: AnalysisInsights,
+    methods_index: dict[str, MethodIndexEntry],
+) -> None:
+    missing: list[str] = []
+    for component in analysis.components:
+        rebuilt: list[FileMethodGroup] = []
+        for group in component.file_methods:
+            file_path = group.file_path
+            methods: list[MethodEntry] = []
+            for method in group.methods:
+                qname = _to_method_qualified_name(method)
+                indexed = methods_index.get(_method_key(file_path, qname))
+                if indexed is None:
+                    missing.append(f"{file_path}|{qname}")
+                    continue
+                methods.append(
+                    MethodEntry(
+                        qualified_name=indexed.qualified_name,
+                        start_line=indexed.start_line,
+                        end_line=indexed.end_line,
+                        node_type=indexed.type,
+                    )
+                )
+
+            methods = sorted(methods, key=lambda m: (m.start_line, m.end_line, m.qualified_name))
+            rebuilt.append(FileMethodGroup(file_path=file_path, methods=methods))
+
+        component.file_methods = rebuilt
+
+    if missing:
+        logger.warning("Missing method index entry for %d ref(s): %s", len(missing), missing)
 
 
 def _relation_to_json(r: Relation) -> RelationJson:
@@ -235,7 +253,6 @@ def from_component_to_json_component(
     sub_analyses: dict[str, tuple[AnalysisInsights, list[Component]]] | None = None,
     processed_ids: set[str] | None = None,
 ) -> ComponentJson:
-    """Convert a Component to a ComponentJson, optionally nesting sub-analysis data."""
     if processed_ids is None:
         processed_ids = set()
 
@@ -277,13 +294,13 @@ def from_analysis_to_json(
     components_json = [
         from_component_to_json_component(c, expandable_components, sub_analyses, None) for c in analysis.components
     ]
-    # Build a dict matching the old AnalysisInsightsJson shape but with nested components
     files_index = _build_files_index_from_analysis(analysis)
     methods_index = _build_methods_index_from_files(files_index)
+    files_json = _build_file_entry_json_from_files(files_index)
     leaf_relations = collect_leaf_relations(analysis)
     data = {
         "description": analysis.description,
-        "files": {fp: entry.model_dump() for fp, entry in files_index.items()},
+        "files": {fp: entry.model_dump() for fp, entry in files_json.items()},
         "methods_index": {k: v.model_dump() for k, v in methods_index.items()},
         "components": [c.model_dump(exclude_none=True) for c in components_json],
         "components_relations": [r.model_dump() for r in leaf_relations],
@@ -336,22 +353,6 @@ def _compute_depth_level(
     return max_depth
 
 
-def collect_leaf_relations(analysis: AnalysisInsights) -> list[RelationJson]:
-    """Convert analysis relations to RelationJson for JSON output.
-
-    When global cross-boundary relations have been computed (by build_global_relations
-    in diagram_generator.py), analysis.components_relations already contains all
-    relations at the deepest available granularity across the full hierarchy.
-
-    For depth-1 analyses (no sub-analyses), the root-level relations generated by
-    AbstractionAgent are used directly.
-
-    The frontend derives visible edges at the appropriate granularity based on
-    the current expansion state.
-    """
-    return [_relation_to_json(rel) for rel in analysis.components_relations]
-
-
 def build_unified_analysis_json(
     analysis: AnalysisInsights,
     expandable_components: list[Component],
@@ -359,11 +360,12 @@ def build_unified_analysis_json(
     sub_analyses: dict[str, tuple[AnalysisInsights, list[Component]]] | None = None,
     file_coverage_summary: FileCoverageSummary | None = None,
     commit_hash: str = "",
+    snapshot_commit: str | None = None,
 ) -> str:
     """Build the full unified analysis JSON with metadata and nested sub-analyses.
 
-    The root-level components_relations contains only leaf-level relations (deepest
-    granularity). The frontend derives visible edges dynamically based on expansion state.
+    The depth_level metadata is computed automatically from the sub_analyses structure
+    if not provided explicitly.
     """
     components_json = [
         from_component_to_json_component(c, expandable_components, sub_analyses, None) for c in analysis.components
@@ -379,6 +381,7 @@ def build_unified_analysis_json(
 
     leaf_relations = collect_leaf_relations(analysis)
     unified = UnifiedAnalysisJson(
+        snapshotCommit=snapshot_commit,
         metadata=AnalysisMetadata(
             generated_at=datetime.now(timezone.utc).isoformat(),
             commit_hash=commit_hash,
@@ -387,12 +390,24 @@ def build_unified_analysis_json(
             file_coverage_summary=summary,
         ),
         description=analysis.description,
-        files=files_index,
+        files=_build_file_entry_json_from_files(files_index),
         methods_index=methods_index,
         components=components_json,
         components_relations=leaf_relations,
     )
     return unified.model_dump_json(indent=2, exclude_none=True)
+
+
+def collect_leaf_relations(analysis: AnalysisInsights) -> list[RelationJson]:
+    """Convert ``analysis.components_relations`` to ``RelationJson`` for JSON output.
+
+    Why: ``rebuild_global_relations`` (in ``diagram_generator``) replaces the root
+    analysis's ``components_relations`` with the deepest-granularity cross-boundary
+    set before save. So this is a pure converter — but a named helper makes the
+    intent ("we are serializing the global leaf set, not per-level relations")
+    explicit at the call sites.
+    """
+    return [_relation_to_json(rel) for rel in analysis.components_relations]
 
 
 def parse_unified_analysis(
@@ -407,23 +422,46 @@ def parse_unified_analysis(
     sub_analyses: dict[str, AnalysisInsights] = {}
     root_analysis = _extract_analysis_recursive(data, sub_analyses)
 
-    files_raw = data.get("files", {})
-    files_index: dict[str, FileEntry] = {path: FileEntry(**entry) for path, entry in files_raw.items()}
     methods_index_raw = data.get("methods_index", {})
-    if methods_index_raw:
-        methods_index: dict[str, MethodIndexEntry] = {
-            key: MethodIndexEntry(**entry) for key, entry in methods_index_raw.items()
-        }
-    else:
-        methods_index = _build_methods_index_from_files(files_index)
+    methods_index: dict[str, MethodIndexEntry] = {
+        key: MethodIndexEntry(**entry) for key, entry in methods_index_raw.items()
+    }
+
+    files_raw = data.get("files", {})
+    files_index = _reconstruct_files_index(files_raw, methods_index)
 
     root_analysis.files = {path: entry.model_copy(deep=True) for path, entry in files_index.items()}
-    _hydrate_component_methods_from_refs(root_analysis, files_index, methods_index)
+    _hydrate_component_methods_from_refs(root_analysis, methods_index)
     for sub in sub_analyses.values():
         sub.files = {path: entry.model_copy(deep=True) for path, entry in files_index.items()}
-        _hydrate_component_methods_from_refs(sub, files_index, methods_index)
+        _hydrate_component_methods_from_refs(sub, methods_index)
 
     return root_analysis, sub_analyses
+
+
+def _reconstruct_files_index(
+    files_raw: dict,
+    methods_index: dict[str, MethodIndexEntry],
+) -> dict[str, FileEntry]:
+    """Rebuild in-memory ``FileEntry`` objects from persisted ``method_keys``."""
+    files_index: dict[str, FileEntry] = {}
+    for file_path, entry_raw in files_raw.items():
+        methods: list[MethodEntry] = []
+        for key in entry_raw["method_keys"]:
+            indexed = methods_index.get(key)
+            if indexed is None:
+                logger.warning("Missing methods_index entry for key %s (file %s)", key, file_path)
+                continue
+            methods.append(
+                MethodEntry(
+                    qualified_name=indexed.qualified_name,
+                    start_line=indexed.start_line,
+                    end_line=indexed.end_line,
+                    node_type=indexed.type,
+                )
+            )
+        files_index[file_path] = FileEntry(methods=methods)
+    return files_index
 
 
 def build_id_to_name_map(root_analysis: AnalysisInsights, sub_analyses: dict[str, AnalysisInsights]) -> dict[str, str]:
@@ -455,7 +493,6 @@ def _extract_analysis_recursive(
         file_methods = [
             FileMethodGroup(
                 file_path=group["file_path"],
-                file_status=ChangeStatus(group.get("file_status", "unchanged")),
                 methods=_method_refs_to_placeholders([str(m) for m in group.get("methods", [])]),
             )
             for group in comp_data.get("file_methods", [])

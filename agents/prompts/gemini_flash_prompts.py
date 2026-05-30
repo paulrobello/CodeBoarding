@@ -15,6 +15,29 @@ Gemini Flash Prompt Design Principles:
 
 from .abstract_prompt_factory import AbstractPromptFactory
 
+SCOPE_RELATIONS_MESSAGE = """Generate inter-component relationships for the `{scope_name}` scope of `{project_name}`.
+
+Project Context:
+{meta_context}
+
+Project Type: {project_type}
+
+Components in this scope:
+{component_summaries}
+
+Cross-component communication from static analysis:
+{cross_component_calls}
+
+Review the components and cross-component communication evidence above. For each relationship, provide: src_name (source component name), dst_name (target component name), and relation (a short phrase like "delegates to", "notifies", "provides data to").
+
+Constraints:
+- Every src_name and dst_name must match an existing component name exactly
+- Maximum 2 relationships per component pair, avoid bidirectional sends/returns pairs (e.g. A sends to B and B returns to A)
+- Focus on architecturally significant interactions
+- Ground relationships in the cross-component communication evidence
+- No relationship between components that never call or are called by each other
+"""
+
 SYSTEM_MESSAGE = """You are a software architecture expert. Your task is to analyze Control Flow Graphs (CFG) for `{project_name}` and generate a high-level data flow overview optimized for diagram generation.
 
 Project Context:
@@ -49,6 +72,10 @@ CFG Clusters:
 Your Task:
 GROUP similar clusters together into logical components based on their relationships and purpose.
 
+CRITICAL requirements:
+- Every cluster ID must be included in exactly one group — no cluster left out, no duplicates
+- Each group must represent a coherent architectural concept justified by method names, call patterns, and inter-cluster connections
+
 Instructions:
 1. Analyze the clusters shown above and identify which ones work together or are functionally related
 2. Group related clusters into meaningful components
@@ -61,16 +88,13 @@ Instructions:
      * What is its main flow/purpose
      * WHY these specific clusters are grouped together (provide clear rationale for the grouping decision)
      * How this group interacts with other cluster groups (which groups it calls, receives data from, or depends on)
+     * The most important classes/methods in this group — mention their exact qualified names as shown in the clusters above
 
 Focus on:
 - Creating cohesive, logical groupings that reflect the actual {project_type} architecture
 - Semantic meaning based on method names, call patterns, and architectural context
 - Clear justification for why clusters belong together
-- Describing inter-group interactions based on the inter-cluster connections
-
-Output Format:
-Return a ClusterAnalysis with cluster_components using ClustersComponent model.
-Each component should have name (descriptive label), cluster_ids (list), and description (comprehensive explanation with rationale and inter-group interactions)."""
+- Describing inter-group interactions based on the inter-cluster connections"""
 
 FINAL_ANALYSIS_MESSAGE = """Create final component architecture for `{project_name}` optimized for flow representation.
 
@@ -84,7 +108,7 @@ Instructions:
 1. Review the named cluster groups above
 2. Decide which named groups should be merged into final components
 3. For each component, specify which named cluster groups it encompasses via source_group_names
-4. Add key entities (2-5 most important classes/methods) for each component using SourceCodeReference
+4. Add key entities (2-5 most important classes/methods) for each component, referencing the source file where they are defined
 5. Define relationships between components
 
 Guidelines for {project_type} projects:
@@ -93,14 +117,7 @@ Guidelines for {project_type} projects:
 - Each component should have clear boundaries
 - Include only architecturally significant relationships
 
-Required outputs:
-- Description: One paragraph explaining the main flow and purpose
-- Components: Each with:
-  * name: Clear component name
-  * description: What this component does
-  * source_group_names: Which named cluster groups from the analysis above this component encompasses (use exact group names)
-  * key_entities: 2-5 most important classes/methods (SourceCodeReference objects with qualified_name and reference_file)
-- Relations: Max 2 relationships per component pair (avoid relations in which we have sends/returns i.e. ComponentA sends a message to ComponentB and ComponentB returns result to ComponentA)
+Each component must have a clear name, a description of what it does, and reference the exact named cluster groups it encompasses (use exact group names). Include 2-5 key entities per component — the most important classes/methods — mentioning their qualified names and source files. Describe the overall architecture in one paragraph explaining the main flow and purpose. Define relationships between components, but limit to at most 2 per component pair and avoid paired sends/returns (e.g. ComponentA sends a message to ComponentB and ComponentB returns the result).
 
 Constraints:
 - Focus on highest level architectural components
@@ -275,12 +292,9 @@ Instructions:
      * What is its main flow/purpose
      * WHY these specific clusters are grouped together (provide clear rationale)
      * How this group interacts with other cluster groups
+     * The most important classes/methods in this group — mention their exact qualified names as shown in the clusters above
 
-Focus on core subsystem functionality only. Avoid cross-cutting concerns like logging or error handling.
-
-Output Format:
-Return a ClusterAnalysis with cluster_components using ClustersComponent model.
-Each component should have name (descriptive label), cluster_ids (list), and description (comprehensive explanation with rationale and inter-group interactions)."""
+Focus on core subsystem functionality only. Avoid cross-cutting concerns like logging or error handling."""
 
 DETAILS_MESSAGE = """Create final sub-component architecture for the `{component}` subsystem of `{project_name}` optimized for flow representation.
 
@@ -294,7 +308,7 @@ Instructions:
 1. Review the named cluster groups above
 2. Decide which named groups should be merged into final sub-components
 3. For each sub-component, specify which named cluster groups it encompasses via source_group_names
-4. Add key entities (2-5 most important classes/methods) for each sub-component using SourceCodeReference
+4. Add key entities (2-5 most important classes/methods) for each sub-component, referencing the source file where they are defined
 5. Define relationships between sub-components
 
 Guidelines for {project_type} projects:
@@ -303,14 +317,7 @@ Guidelines for {project_type} projects:
 - Each sub-component should have clear boundaries
 - Include only architecturally significant relationships
 
-Required outputs:
-- Description: One paragraph explaining the subsystem's main flow and purpose
-- Components: Each with:
-  * name: Clear sub-component name
-  * description: What this sub-component does
-  * source_group_names: Which named cluster groups from the analysis above this sub-component encompasses (use exact group names)
-  * key_entities: 2-5 most important classes/methods (SourceCodeReference objects with qualified_name and reference_file)
-- Relations: Max 2 relationships per component pair (avoid relations in which we have sends/returns i.e. ComponentA sends a message to ComponentB and ComponentB returns result to ComponentA)
+Each sub-component must have a clear name, a description of what it does, and reference the exact named cluster groups it encompasses (use exact group names). Include 2-5 key entities per sub-component — the most important classes/methods — mentioning their qualified names and source files. Describe the subsystem's main flow and purpose in one paragraph. Define relationships between sub-components, but limit to at most 2 per component pair and avoid paired sends/returns (e.g. ComponentA sends a message to ComponentB and ComponentB returns the result).
 
 Constraints:
 - Focus on subsystem-specific functionality
@@ -318,6 +325,35 @@ Constraints:
 - Sub-components should translate well to flow diagram representation
 
 Justify component choices based on fundamental architectural importance."""
+
+
+INCREMENTAL_GROUPING_MESSAGE = """Update the architecture of `{project_name}` by routing changed and new CFG clusters to the right components.
+
+Project Context:
+{meta_context}
+
+Project Type: {project_type}
+
+The previous analysis established the components below. Most clusters are unchanged and stay where they are; this prompt only shows the slice that changed (new clusters or clusters whose member methods changed).
+
+### Existing components
+{existing_components}
+
+### Cluster groups to assign
+{cfg_clusters}
+
+Your Task:
+For each cluster shown above, decide which component it belongs to. Work through the clusters and for each one choose one of two paths:
+
+1. **Route to an existing component.** Reference the component by its exact **component_id** from the list above (e.g. `1.3`). Carry over the component's **name** and a short **description** unchanged, and list the cluster ids that should land here. Multiple groups of clusters can point to the same existing component — that is fine and expected.
+
+   For each routed cluster, also indicate whether a **redetail** pass is needed. Default to yes. Only say no when the change is cosmetic — a refactor, internal rename, small bug fix, or formatting change that leaves the component's high-level purpose untouched. When redetail is not needed, the existing description is preserved as-is and no follow-up pass runs. If you are unsure, lean toward yes.
+
+2. **Create a new component.** Give it a fresh **name** that does not duplicate any existing component, write a **description** explaining what this component does and why these clusters belong together, and choose a **parent_id** — the existing component whose scope most naturally encloses the new one, or leave it null for a root-level component.
+
+Important rules:
+- Identity is tracked by **component_id**, not by name. Reusing an existing component's name without pointing to its component_id will create a duplicate — that is wrong. If clusters belong in an existing component, you must reference its **component_id**.
+- Every cluster id listed in the "Cluster groups to assign" section must appear in exactly one entry's **cluster_ids**."""
 
 
 class GeminiFlashPromptFactory(AbstractPromptFactory):
@@ -367,3 +403,9 @@ class GeminiFlashPromptFactory(AbstractPromptFactory):
 
     def get_details_message(self) -> str:
         return DETAILS_MESSAGE
+
+    def get_incremental_grouping_message(self) -> str:
+        return INCREMENTAL_GROUPING_MESSAGE
+
+    def get_scope_relations_message(self) -> str:
+        return SCOPE_RELATIONS_MESSAGE

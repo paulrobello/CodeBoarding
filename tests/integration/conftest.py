@@ -8,13 +8,19 @@ This module provides:
 """
 
 import json
+import os
+import platform
+import shutil
+import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator
 
 import pytest
 
+from static_analyzer.constants import Language
 from static_analyzer.programming_language import ProgrammingLanguage, JavaConfig
 from utils import get_config
 
@@ -126,6 +132,36 @@ REPOSITORY_CONFIGS = [
             "lsp_server_key": "typescript",
         },
     ),
+    RepositoryTestConfig(
+        name="clap_rust",
+        repo_url="https://github.com/clap-rs/clap",
+        pinned_commit="v4.5.20",
+        language="Rust",
+        fixture_file="clap_rust.json",
+        mock_language={
+            "language": "Rust",
+            "size": 50000,
+            "percentage": 100.0,
+            "suffixes": [".rs"],
+            "server_commands": ["rust-analyzer"],
+            "lsp_server_key": "rust",
+        },
+    ),
+    RepositoryTestConfig(
+        name="serilog_csharp",
+        repo_url="https://github.com/serilog/serilog",
+        pinned_commit="v4.2.0",
+        language="CSharp",
+        fixture_file="serilog_csharp.json",
+        mock_language={
+            "language": "CSharp",
+            "size": 100000,
+            "percentage": 100.0,
+            "suffixes": [".cs"],
+            "server_commands": ["csharp-ls"],
+            "lsp_server_key": "csharp",
+        },
+    ),
 ]
 
 
@@ -185,7 +221,7 @@ def load_fixture(fixture_filename: str) -> dict:
         return json.load(f)
 
 
-def extract_metrics(static_analysis, language: str) -> dict:
+def extract_metrics(static_analysis, language: Language) -> dict:
     """Extract comparable metrics from StaticAnalysisResults.
 
     Args:
@@ -203,11 +239,7 @@ def extract_metrics(static_analysis, language: str) -> dict:
         nodes_count = 0
         edges_count = 0
 
-    try:
-        references = static_analysis.results.get(language, {}).get("references", {})
-        references_count = len(references)
-    except (KeyError, AttributeError):
-        references_count = 0
+    references_count = sum(1 for _ in static_analysis.iter_reference_nodes(language))
 
     try:
         packages = static_analysis.get_package_dependencies(language)
@@ -241,6 +273,36 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="function")
 def temp_workspace() -> Generator[Path, None, None]:
-    """Provide a temporary directory for test isolation."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        yield Path(tmp_dir)
+    """Temporary directory per test, with Windows-tolerant teardown."""
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        yield tmp_dir
+    finally:
+        _robust_rmtree(tmp_dir)
+
+
+def _clear_readonly_and_retry(func, path, _exc):
+    """``rmtree`` onexc handler: clear the read-only bit and retry the op.
+
+    Git pack files are read-only on Windows and trip ``shutil.rmtree``.
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+    except Exception:
+        pass
+
+
+def _robust_rmtree(path: Path) -> None:
+    is_windows = platform.system() == "Windows"
+    attempts = 5 if is_windows else 1
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+            return
+        except PermissionError:
+            if not is_windows or attempt == attempts - 1:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+        except FileNotFoundError:
+            return
