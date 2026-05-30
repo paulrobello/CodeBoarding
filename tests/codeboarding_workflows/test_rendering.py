@@ -192,6 +192,16 @@ def _make_depth3_unified_json() -> dict:
         ],
         # Only leaf-level relations — what rebuild_global_relations produces.
         "components_relations": [
+            # Sibling edge inside Public (1.1.1 -> 1.1.2) — survives at the Public level.
+            {
+                "relation": "delegates to",
+                "src_name": "REST",
+                "dst_name": "GraphQL",
+                "src_id": "1.1.1",
+                "dst_id": "1.1.2",
+                "edge_count": 1,
+                "is_static": True,
+            },
             {
                 "relation": "calls",
                 "src_name": "REST",
@@ -257,8 +267,8 @@ def test_render_docs_root_has_no_phantom_nodes(tmp_path: Path):
     assert edges, "Root mermaid has no edges; expected leaf relations to roll up to 1->2, 1->3"
 
 
-def test_render_docs_sub_level_has_edges(tmp_path: Path):
-    """A sub-analysis diagram must contain at least one edge when its components have leaf relations."""
+def test_render_docs_sub_level_renders_sibling_edges(tmp_path: Path):
+    """The Public sub-analysis ({1.1.1, 1.1.2}) must render the leaf sibling edge 1.1.1->1.1.2."""
     analysis_path = tmp_path / "analysis.json"
     analysis_path.write_text(json.dumps(_make_depth3_unified_json()))
 
@@ -271,24 +281,13 @@ def test_render_docs_sub_level_has_edges(tmp_path: Path):
         root_name="overview",
     )
 
-    # The "1" sub-analysis (API) covers 1.1 (Public). 1.1 covers 1.1.1 / 1.1.2.
-    # At the API level the leaf relations should project to 1.1 -> 2.1 (Core/Auth's
-    # ancestor in the level is Auth itself if Auth is in the level — but it isn't,
-    # because the level is {"1.1"}). So edges in API.md will roll up cross-component
-    # to whatever ancestor of dst lives in the level. Since the API level only has
-    # one component {1.1}, all leaf relations from 1.1.x to outside roll up to dst
-    # outside the level and are dropped. We instead check the 1.1 level, which
-    # contains REST + GraphQL.
     public_md = (tmp_path / "Public.md").read_text()
-    _, edges = _extract_mermaid_nodes_and_edges(public_md.split("```")[1])
-    # The 1.1 level has {1.1.1, 1.1.2}. None of the leaf relations are between
-    # 1.1.1 and 1.1.2, so this level produces no edges — that's correct.
-    # But the API.md level has {1.1} — also no edges by the same logic.
-    # The point of this test is to catch the all-zero-edges case at root, which the
-    # first test already does. We just ensure rendering produced both files without
-    # crashing on the sub-level path.
-    assert (tmp_path / "API.md").exists()
-    assert (tmp_path / "Public.md").exists()
+    nodes, edges = _extract_mermaid_nodes_and_edges(public_md.split("```")[1])
+    assert {"REST", "GraphQL"}.issubset(nodes)
+    assert ("REST", "GraphQL") in edges, edges
+    # No phantoms at sub-level either.
+    for src, dst in edges:
+        assert src in nodes and dst in nodes, (src, dst, nodes)
 
 
 def test_load_entries_projects_per_level(tmp_path: Path):
@@ -302,6 +301,7 @@ def test_load_entries_projects_per_level(tmp_path: Path):
     fname, root_analysis, _ = entries[0]
     assert fname == "__root__"
     root_pairs = {(r.src_id, r.dst_id) for r in root_analysis.components_relations}
-    # All three leaf relations roll up: 1.1.1->2.1 to 1->2, 1.1.1->3 to 1->3, 1.1.2->2.1 to 1->2.
-    # The two 1->2 edges aggregate into a single Relation.
+    # Leaf relations roll up at root: 1.1.1->2.1 and 1.1.2->2.1 both collapse to
+    # 1->2 (aggregated); 1.1.1->3 collapses to 1->3; 1.1.1->1.1.2 collapses to a
+    # 1->1 self-loop and is dropped.
     assert root_pairs == {("1", "2"), ("1", "3")}

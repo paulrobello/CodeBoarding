@@ -47,10 +47,8 @@ class ComponentJson(Component):
     components: list["ComponentJson"] | None = Field(
         description="Sub-components if expanded, None otherwise.", default=None
     )
-    # All cross-component relations are serialized once at the root as a global
-    # leaf-only set (see ``collect_leaf_relations``). Renderers project that set
-    # down to each level via ``project_relations_to_level``; sub-components no
-    # longer carry their own ``components_relations`` field.
+    # No per-level ``components_relations`` field: all relations live once on the
+    # root analysis as a global leaf-only set, projected to each level at render time.
 
 
 class NotAnalyzedFile(BaseModel):
@@ -294,16 +292,17 @@ def from_analysis_to_json(
     components_json = [
         from_component_to_json_component(c, expandable_components, sub_analyses, None) for c in analysis.components
     ]
+    # Build a dict matching the old AnalysisInsightsJson shape but with nested components
+    relations_json = [_relation_to_json(r) for r in analysis.components_relations]
     files_index = _build_files_index_from_analysis(analysis)
     methods_index = _build_methods_index_from_files(files_index)
     files_json = _build_file_entry_json_from_files(files_index)
-    leaf_relations = collect_leaf_relations(analysis)
     data = {
         "description": analysis.description,
         "files": {fp: entry.model_dump() for fp, entry in files_json.items()},
         "methods_index": {k: v.model_dump() for k, v in methods_index.items()},
         "components": [c.model_dump(exclude_none=True) for c in components_json],
-        "components_relations": [r.model_dump() for r in leaf_relations],
+        "components_relations": [r.model_dump() for r in relations_json],
     }
 
     return json.dumps(data, indent=2)
@@ -379,7 +378,7 @@ def build_unified_analysis_json(
     else:
         summary = file_coverage_summary
 
-    leaf_relations = collect_leaf_relations(analysis)
+    relations_json = [_relation_to_json(r) for r in analysis.components_relations]
     unified = UnifiedAnalysisJson(
         snapshotCommit=snapshot_commit,
         metadata=AnalysisMetadata(
@@ -393,21 +392,9 @@ def build_unified_analysis_json(
         files=_build_file_entry_json_from_files(files_index),
         methods_index=methods_index,
         components=components_json,
-        components_relations=leaf_relations,
+        components_relations=relations_json,
     )
     return unified.model_dump_json(indent=2, exclude_none=True)
-
-
-def collect_leaf_relations(analysis: AnalysisInsights) -> list[RelationJson]:
-    """Convert ``analysis.components_relations`` to ``RelationJson`` for JSON output.
-
-    Why: ``rebuild_global_relations`` (in ``diagram_generator``) replaces the root
-    analysis's ``components_relations`` with the deepest-granularity cross-boundary
-    set before save. So this is a pure converter — but a named helper makes the
-    intent ("we are serializing the global leaf set, not per-level relations")
-    explicit at the call sites.
-    """
-    return [_relation_to_json(rel) for rel in analysis.components_relations]
 
 
 def parse_unified_analysis(

@@ -23,11 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def _ancestor_in_level(component_id: str, level_ids: set[str]) -> str | None:
-    """Return the closest ancestor (or the id itself) that lives in *level_ids*.
-
-    Walks the dotted hierarchy from leaf toward root. Returns ``None`` if no
-    ancestor is in the level (the component is outside this view).
-    """
+    """Return the closest ancestor (or the id itself) that lives in *level_ids*, else ``None``."""
     if component_id in level_ids:
         return component_id
     parts = component_id.split(".")
@@ -43,19 +39,17 @@ def project_relations_to_level(
     level_component_ids: set[str],
     id_to_name: dict[str, str],
 ) -> list[Relation]:
-    """Project a global leaf-only relation set onto the components visible at a level.
+    """Roll up a global leaf-only relation set onto the components visible at a level.
 
-    For each leaf relation ``src_id -> dst_id``, roll up both endpoints to the
-    ancestor that lives in ``level_component_ids``. Drops edges where both
-    endpoints collapse to the same level component (would render as self-loop),
-    and aggregates duplicates by keeping the first label seen and summing
-    ``edge_count``.
+    Each leaf relation's endpoints are projected to the ancestor in
+    ``level_component_ids``; edges that collapse to a self-loop or whose
+    endpoint isn't a descendant of any level component are dropped.
+    Duplicates after roll-up are merged by summing ``edge_count`` and keeping
+    the first label seen.
 
-    Why: ``components_relations`` is stored once at the root as the deepest
-    cross-boundary set. Each rendered level needs only edges visible at *that*
-    level — mermaid would otherwise reference component names that aren't
-    declared as nodes ("phantom nodes"), which is exactly what Devin flagged
-    on PR #246.
+    Why: cross-boundary relations are stored once at the root as the deepest
+    set. Without this projection, mermaid would emit edges to component names
+    that aren't declared as nodes at the rendered level (phantom nodes).
     """
     aggregated: dict[tuple[str, str], Relation] = {}
     for rel in global_relations:
@@ -94,14 +88,9 @@ _FORMAT_WRITERS: dict[str, tuple[str, bool]] = {
 def _load_entries(analysis_path: Path) -> list[tuple[str, AnalysisInsights, set[str]]]:
     """Return ``(filename, analysis, expanded_component_ids)`` for root + each sub-analysis.
 
-    The root entry's filename is supplied by the caller (see :func:`render_docs`);
-    here we emit it as ``"__root__"`` for the caller to rename.
-
-    Each entry's ``analysis.components_relations`` is replaced with the global
-    leaf set projected down to the components visible at that level (see
-    ``project_relations_to_level``). This is what keeps the rendered mermaid
-    diagrams free of phantom nodes once cross-boundary relations are stored as
-    a single global leaf set at the root of ``analysis.json``.
+    Each entry's ``components_relations`` is replaced with the root's global
+    leaf set projected to that level (see :func:`project_relations_to_level`).
+    The root entry uses ``"__root__"`` as a placeholder filename for the caller.
     """
     with open(analysis_path, "r", encoding="utf-8") as f:
         data = json.load(f)

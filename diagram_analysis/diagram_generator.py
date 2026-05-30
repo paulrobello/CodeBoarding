@@ -31,7 +31,7 @@ from diagram_analysis.cluster_delta import compute_cluster_delta
 from diagram_analysis.cluster_snapshot import snapshot_from_static_analysis
 from diagram_analysis.exceptions import IncrementalCacheMissingError
 from diagram_analysis.file_coverage import FileCoverage
-from diagram_analysis.io_utils import load_full_analysis, normalize_repo_path, save_analysis, save_sub_analysis
+from diagram_analysis.io_utils import normalize_repo_path, save_analysis
 from diagram_analysis.version import Version
 
 from health.config import initialize_health_dir, load_health_config
@@ -473,16 +473,8 @@ class DiagramGenerator:
             # Process components using a frontier queue: submit children as soon as parent finishes.
             expanded_components, sub_analyses = self._generate_subcomponents(analysis, root_components)
 
-            # Replace per-level LLM relations with the global cross-boundary set
-            # built from the full CFG so deep edges like ``1.1.1 -> 2.1.2`` survive
-            # at the deepest available granularity.
             if sub_analyses:
-                global_relations = self.rebuild_global_relations(analysis, sub_analyses)
-                if global_relations:
-                    logger.info(
-                        "Replaced per-level relations with %d global cross-boundary relations",
-                        len(global_relations),
-                    )
+                self.rebuild_global_relations(analysis, sub_analyses)
 
             commit_hash = get_git_commit_hash(self.repo_location)
             self._strip_ignored(analysis, sub_analyses)
@@ -513,73 +505,14 @@ class DiagramGenerator:
 
         Walks the full CFG with a global node->deepest-component-id map so we
         catch edges like ``1.1.1 -> 2.1.2`` that per-level analysis cannot see.
-        Mutates ``root_analysis.components_relations`` in place and returns the
-        new list. Returns ``[]`` if no static-analysis backend is available
-        (legacy / mocked code paths).
+        Mutates ``root_analysis.components_relations`` in place.
         """
         if not self.static_analysis:
             return []
-
         cfg_graphs = {str(lang): self.static_analysis.get_cfg(lang) for lang in self.static_analysis.get_languages()}
         global_relations = build_global_relations(root_analysis, sub_analyses, cfg_graphs)
         root_analysis.components_relations = global_relations
         return global_relations
-
-    def expand_component(
-        self,
-        component: Component,
-    ) -> tuple[AnalysisInsights, list[Component]] | None:
-        """Detail-analyze a single component and persist the updated unified analysis.
-
-        Shared path for CLI ``partial`` updates and IDE expand operations. The
-        caller is responsible for loading the existing analysis and locating
-        the target component.
-
-        Why: ``components_relations`` is no longer serialized per sub-analysis
-        (see ``analysis_json.collect_leaf_relations``). To keep the freshly
-        produced sub-analysis's LLM relation labels — which would otherwise be
-        dropped by the ``save_sub_analysis`` -> ``load_full_analysis`` round-trip
-        — we merge the in-memory ``sub_analysis`` (with its labels) into the
-        reloaded ``sub_analyses`` dict before calling ``rebuild_global_relations``.
-
-        Returns ``(sub_analysis, new_components)`` on success, ``None`` on failure.
-        """
-        if self.details_agent is None or self.abstraction_agent is None:
-            self.pre_analysis()
-
-        comp_id, sub_analysis, new_components = self.process_component(component)
-        if comp_id is None or sub_analysis is None:
-            logger.error("Failed to generate sub-analysis for component '%s'", component.component_id)
-            return None
-
-        output_dir = Path(self.output_dir)
-        save_sub_analysis(sub_analysis, output_dir, component.component_id)
-        logger.info("Saved sub-analysis for component '%s'", component.component_id)
-
-        updated = load_full_analysis(output_dir)
-        if not updated:
-            logger.warning(
-                "Could not reload analysis after saving sub-analysis for '%s'; " "global relations were not rebuilt",
-                comp_id,
-            )
-            return sub_analysis, new_components
-
-        updated_root, updated_subs = updated
-        # Override the round-tripped (label-less) sub-analysis with the in-memory
-        # one so ``rebuild_global_relations`` sees the just-produced LLM labels.
-        updated_subs[comp_id] = sub_analysis
-
-        global_relations = self.rebuild_global_relations(updated_root, updated_subs)
-        if global_relations:
-            save_analysis(
-                analysis=updated_root,
-                output_dir=output_dir,
-                sub_analyses=updated_subs,
-                repo_name=self.repo_name,
-            )
-            logger.info("Rebuilt %d global relations after expanding '%s'", len(global_relations), comp_id)
-
-        return sub_analysis, new_components
 
     def _collect_method_entries_from_static_analysis(self) -> dict[str, list]:
         assert self.static_analysis is not None
@@ -728,16 +661,9 @@ class DiagramGenerator:
             if touched_scopes:
                 incremental_agent.generate_all_scope_relations(root_analysis, sub_analyses, touched_scopes)
 
-            # After per-scope LLM labels are regenerated, recompute the global
-            # cross-boundary relation set so deep edges between any two
-            # components (across scopes, across roots) are present at the
-            # deepest available granularity.
-            global_relations = self.rebuild_global_relations(root_analysis, sub_analyses)
-            if global_relations:
-                logger.info(
-                    "[incremental] replaced per-level relations with %d global cross-boundary relations",
-                    len(global_relations),
-                )
+            # generate_all_scope_relations seeded per-scope LLM labels above;
+            # this overlay merges them into the deepest-granularity global set.
+            self.rebuild_global_relations(root_analysis, sub_analyses)
 
             # Rebuild the global files index, unioning every sub-analysis's
             # files into root. The incremental flow never reruns AbstractionAgent
