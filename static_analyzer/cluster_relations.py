@@ -7,9 +7,10 @@ edges — no LLM needed.
 
 import logging
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from agents.agent_responses import AnalysisInsights, Relation
+from agents.agent_responses import AnalysisInsights, Relation, RelationLLM
 from static_analyzer.graph import CallGraph
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ def build_component_relations(
 
 
 def merge_relations(
-    llm_relations: list[Relation],
+    llm_relations: Sequence[RelationLLM],
     static_relations: list[ClusterRelation],
     analysis: AnalysisInsights,
 ) -> list[Relation]:
